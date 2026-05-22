@@ -1,0 +1,335 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os2.h"
+#include "adc.h"
+#include "dac.h"
+#include "dcache.h"
+#include "gpdma.h"
+#include "i2c.h"
+#include "icache.h"
+#include "iwdg.h"
+#include "spi.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include "cnnx_proj.h"
+#include "lvgl/lvgl.h"
+#include "lv_port_disp.h"
+#include "lv_port_indev.h"
+#include "lvgl/demos/lv_demos.h"
+#include "ST7789V2.h"
+#include "ui.h"
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+// proxy function to access a static function
+void CNNX_I2C1_Init(void) {
+  MX_I2C1_Init();
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+
+	HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_GPDMA1_Init();
+  MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
+  MX_I2C1_Init();
+  MX_I2C2_Init();
+  MX_SPI1_Init();
+  MX_SPI2_Init();
+  MX_SPI3_Init();
+  MX_SPI6_Init();
+  MX_TIM8_Init();
+  MX_ADC1_Init();
+  MX_DAC1_Init();
+  MX_ADC2_Init();
+  MX_TIM1_Init();
+  MX_DCACHE1_Init();
+  MX_ICACHE_Init();
+  MX_IWDG_Init();
+  MX_TIM6_Init();
+  /* USER CODE BEGIN 2 */
+
+  /* ── 콜드 부트 진단: 여기까지 도달하면 MX_*_Init() 모두 통과 ── */
+  printf("\r\n[BOOT-1] MX_Init all passed\r\n");
+
+  HAL_TIM_Base_Start_IT(&htim6);   // Loop-1 motor control ISR start
+  printf( "\r\n\n\n\n\n\007   cnnx H562 FreeRTOS lvgl v8.3.11 Test @ %s %s \r\n\n", __DATE__, __TIME__ ) ;
+  //  LCD Backlight OFF — lvglHandler에서 첫 프레임 렌더링 후 켜짐 (노이즈 방지)
+  DEV_BL_PIN = 0 ;
+
+  /* 콜드 부트 시 LCD 전원 안정화 대기 (ST7789V2 VDD/VDDI settle) */
+  HAL_Delay(500);
+
+  //   Initialize lvgl
+  lv_init();            //Initialize LVGL UI library
+  lv_port_disp_init();  // initialize the display drivers (1차 시도)
+
+  /* 콜드 부트 LCD 재초기화: 전원 off→on 시 1차 init이 실패할 수 있음.
+   * 2차 init으로 확실히 LCD를 초기화. (디버거 리셋 시에도 무해) */
+  {
+      extern void ST7789V2_Init(unsigned char);
+      HAL_Delay(100);
+      ST7789V2_Init(ST7789V2_VERTICAL);   // 2차: HW reset + SW reset (VERTICAL 모드 유지)
+      printf("   LCD re-init done (cold boot safety)\r\n");
+  }
+
+  lv_port_indev_init();
+  printf("   ... lv_port_disp_init() & lv_port_indev_init() OK\r\n");
+
+  /* IWDG 시작: 타임아웃 ~4초 (LSI 32kHz, /64, reload 2000) */
+  /* LSI는 SystemClock_Config에서 이미 ON */
+  DBGMCU->APB1FZR1 |= DBGMCU_APB1FZR1_DBG_IWDG_STOP; /* 디버그 시 IWDG 정지 */
+  IWDG->KR  = 0xCCCC;  /* Start IWDG */
+  IWDG->KR  = 0x5555;  /* Write access enable */
+  IWDG->PR  = 4;       /* /64 */
+  IWDG->RLR = 2000;
+  { uint32_t t = HAL_GetTick();
+    while (IWDG->SR && (HAL_GetTick() - t) < 100) {} }
+  IWDG->KR  = 0xAAAA;  /* 초기 refresh */
+
+  /* 부트 카운터 — surge/burst 시험 중 무한 reset 루프 진단용.
+   * BKP30R 에 누적 횟수. WatchdogTask 가 30초 안정 후 0 으로 클리어. */
+  {
+    extern void Wdg_BootCounter_Init(void);
+    extern uint32_t Wdg_BootCounter_Get(void);
+    Wdg_BootCounter_Init();
+    char bcbuf[64];
+    int n = snprintf(bcbuf, sizeof(bcbuf), "Boot counter: %lu\r\n",
+                     (unsigned long)Wdg_BootCounter_Get());
+    HAL_UART_Transmit(&huart1, (uint8_t*)bcbuf, (uint16_t)n, 100);
+  }
+
+  /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+  /* Call init function for freertos objects (in app_freertos.c) */
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
+
+  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLL1_SOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 2;
+  RCC_OscInitStruct.PLL.PLLN = 120;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1_VCIRANGE_2;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1_VCORANGE_WIDE;
+  RCC_OscInitStruct.PLL.PLLFRACN = 0;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
+                              |RCC_CLOCKTYPE_PCLK3;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV4;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+   /* Select SysTick source clock */
+  HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
+
+   /* Re-Initialize Tick with new clock source */
+  if (HAL_InitTick(TICK_INT_PRIORITY) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the programming delay
+  */
+  __HAL_FLASH_SET_PROGRAM_DELAY(FLASH_PROGRAMMING_DELAY_2);
+
+  /* CSS — HSE 결정자 실패 시 NMI → NVIC_SystemReset 자동 복구 */
+  HAL_RCC_EnableCSS();
+}
+
+/* USER CODE BEGIN 4 */
+void Loop1_TIM6_ISR_Handler(void);   /* my_tasks.c */
+/* USER CODE END 4 */
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM7 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    Loop1_TIM6_ISR_Handler();
+    return;
+  }
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM7)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

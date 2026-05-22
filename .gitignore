@@ -1,0 +1,13 @@
+# Build output
+Debug/
+Release/
+
+# IDE settings (optional, can be regenerated)
+.settings/
+
+# Claude Code session data
+.claude/
+*.ctu-info
+
+# Node.js (PPT generator dependencies)
+node_modules/

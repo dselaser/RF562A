@@ -1,0 +1,1045 @@
+#include "stm32h5xx_hal.h"
+#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include <string.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "usart.h"
+#include "uart_cmd.h"
+#include <ctype.h>
+
+// PID / Target 제어용 extern
+#include "my_tasks.h"  /* USE_LINEAR_ACTUATOR 정의 포함 */
+#if !USE_LINEAR_ACTUATOR
+extern void     VCA_PID_SetGains(float kp, float ki, float kd);
+extern void     VCA_PID_GetGains(float *kp, float *ki, float *kd);
+extern void     VCA_SetTargetADC(uint16_t adc_target);
+extern uint16_t VCA_GetTargetADC(void);
+#endif
+extern volatile float g_needle_depth_mm;
+extern volatile uint8_t g_vca_state;
+extern volatile uint8_t g_hp_error;
+extern osThreadId_t ads8325TaskHandle;
+
+// 외부 UART 핸들 (명령 포트는 UART1)
+extern UART_HandleTypeDef huart1;
+
+#if !USE_LINEAR_ACTUATOR
+// G 명령으로 저장해 둘 pending target (ADC 단위)
+static uint16_t s_vca_pending_target_adc = 25000;
+
+// V 명령용: 25k <-> 45k 1Hz 왕복
+static bool     s_vca_vmode_enable = false;
+static uint16_t s_vca_v_low  = 25000;
+static uint16_t s_vca_v_high = 35000;
+static uint32_t s_vca_v_last_tick = 0;
+static uint32_t s_vca_v_half_period_ms = 500;   // 기본 1Hz (500ms)
+#endif
+
+// ================== 설정 ==================
+#define CMD_LINE_MAX    64
+#define RXQ_LEN         64
+#define TASKSTAT_MAX    16
+
+// ================== 정적 자원 ==================
+static QueueHandle_t s_rxq = NULL;
+static uint8_t       s_rx_byte;            // IT 재예약용 1바이트
+static TaskHandle_t  sUartCmdTaskHandle = NULL;
+
+// Task 통계용 전역 버퍼 (스택 절약)
+static TaskStatus_t gTaskStatus[TASKSTAT_MAX];
+
+// 't' 통계는 리셋 시 자동으로 1회 출력하고, 이후에도 1회 입력으로 바로 출력되게 구성
+
+// ================== 로컬 함수 선언 ==================
+static void Terminal_ClearScreenAndBanner(void);
+static void uart_write_str(const char *s);
+static void uart_write_len(const uint8_t *buf, size_t n);
+static void uart_send_data(const uint8_t *buf, uint16_t len);
+static void uart_echo_byte(uint8_t ch);
+
+static void print_task_stats(UART_HandleTypeDef *huart);
+static void print_heap_stats(void);
+static void handle_user_command(const char *line);
+
+
+
+// ---- CPU 런타임 카운터 기준값 (TC 명령용) ----
+typedef struct {
+    TaskHandle_t handle;
+    uint32_t     baseCounter;
+} TaskCpuBaseline_t;
+
+static TaskCpuBaseline_t gTaskCpuBaseline[TASKSTAT_MAX];
+static configRUN_TIME_COUNTER_TYPE gBaseTotalRunTime = 0;
+static uint8_t  gBaseValid = 0;
+
+static void TaskCpu_ResetAllBaselines(void);
+static uint32_t TaskCpu_GetDeltaCounter(const TaskStatus_t *ts);
+
+
+/*
+static void cmd_A5(void)
+{
+    if (ads8325TaskHandle != NULL) {
+        xTaskNotifyGive(ads8325TaskHandle);
+    }
+}
+*/
+
+// ===== CPU 런타임 카운터 기준값 리셋 (TC 명령) =====
+static void TaskCpu_ResetAllBaselines(void)
+{
+    TaskStatus_t *statusArr = gTaskStatus;
+    UBaseType_t n = uxTaskGetNumberOfTasks();
+    if (n > TASKSTAT_MAX) n = TASKSTAT_MAX;
+
+    configRUN_TIME_COUNTER_TYPE totalRunTime = 0;
+    n = uxTaskGetSystemState(statusArr, n, &totalRunTime);
+
+    gBaseTotalRunTime = totalRunTime;
+    gBaseValid = 1;
+
+    for (UBaseType_t i = 0; i < n; i++) {
+        gTaskCpuBaseline[i].handle      = statusArr[i].xHandle;
+        gTaskCpuBaseline[i].baseCounter = statusArr[i].ulRunTimeCounter;
+    }
+    for (UBaseType_t i = n; i < TASKSTAT_MAX; i++) {
+        gTaskCpuBaseline[i].handle      = NULL;
+        gTaskCpuBaseline[i].baseCounter = 0;
+    }
+}
+
+
+// 기준값을 뺀 “delta” 카운터 얻기
+static uint32_t TaskCpu_GetDeltaCounter(const TaskStatus_t *ts)
+{
+    if (!ts) return 0;
+
+    for (UBaseType_t i = 0; i < TASKSTAT_MAX; i++) {
+        if (gTaskCpuBaseline[i].handle == ts->xHandle) {
+            uint32_t base = gTaskCpuBaseline[i].baseCounter;
+            uint32_t now  = ts->ulRunTimeCounter;
+
+            // wrap-aware delta
+            return (uint32_t)(now - base);
+            // unsigned subtraction은 wrap 포함해서 자동으로 올바른 delta가 나옵니다.
+        }
+    }
+
+    // 기준값 없는 Task는 0으로 처리(“누적값 그대로”는 왜곡을 만들기 쉬움)
+    return 0;
+}
+
+
+// ====== 번호로 TaskHandle 찾기: Task 이름이 "1_...", "2_..." 형식이라고 가정
+static TaskHandle_t find_task_by_index(int idx)
+{
+    TaskStatus_t *statusArr = gTaskStatus;
+    UBaseType_t n = uxTaskGetNumberOfTasks();
+    if (n > TASKSTAT_MAX) n = TASKSTAT_MAX;
+
+    n = uxTaskGetSystemState(statusArr, n, NULL);
+
+    char prefix[8];
+    snprintf(prefix, sizeof(prefix), "%02d", idx);   /* 2자리: K1→"01" → "01_LEDTask" 매칭 */
+    size_t plen = strlen(prefix);
+
+    for (UBaseType_t i = 0; i < n; i++) {
+        const char *name = statusArr[i].pcTaskName;
+        if (!name) continue;
+
+        // 이름이 "idx_..." 또는 "idx"로 시작하면 매칭
+        if (strncmp(name, prefix, plen) == 0 &&
+            (name[plen] == '_' || name[plen] == '\0')) {
+            return statusArr[i].xHandle;
+        }
+    }
+    return NULL;
+}
+
+// ===== 특정 Task는 보호해서 Kx/KA로 Suspend 못 하게 함
+static bool is_task_protected_name(const char *name)
+{
+    if (!name) return true;
+
+    // FreeRTOS 기본 IDLE Task
+    if (strncmp(name, "IDLE", 4) == 0) return true;
+
+    // Timer Service Task
+    if (strncmp(name, "Tmr Svc", 7) == 0) return true;
+
+    // UART 콘솔 Task (이름에 UARTCmd 들어가면 보호)
+    if (strstr(name, "UARTCmd") != NULL) return true;
+
+    return false;
+}
+
+
+// ==== TaskHandle로 Task 이름 찾기 (gTaskStatus 버퍼 사용)
+static const char *get_task_name_by_handle(TaskHandle_t h)
+{
+    if (h == NULL) return NULL;
+
+    TaskStatus_t *statusArr = gTaskStatus;
+    UBaseType_t n = uxTaskGetNumberOfTasks();
+    if (n > TASKSTAT_MAX) n = TASKSTAT_MAX;
+
+    n = uxTaskGetSystemState(statusArr, n, NULL);
+
+    for (UBaseType_t i = 0; i < n; i++) {
+        if (statusArr[i].xHandle == h) {
+            return statusArr[i].pcTaskName;
+        }
+    }
+    return NULL;
+}
+
+
+// ================== 화면 클리어 + 배너 ==================
+static void Terminal_ClearScreenAndBanner(void)
+{
+    // 1) 줄을 여러 개 보내서 기존 내용 위로 밀어버리기
+    for (int i = 0; i < 40; i++) {
+        const char *nl = "\r\n";
+        HAL_UART_Transmit(&huart1, (uint8_t*)nl, 2, HAL_MAX_DELAY);
+    }
+
+    // 2) 배너 출력
+    const char *banner =
+        "RF474 FreeRTOS Console \r\n";
+
+    HAL_UART_Transmit(&huart1, (uint8_t*)banner, strlen(banner), HAL_MAX_DELAY);
+
+    // 3) 프롬프트 출력
+    const char *prompt = "> ";
+    HAL_UART_Transmit(&huart1, (uint8_t*)prompt, strlen(prompt), HAL_MAX_DELAY);
+}
+
+// ================== Help 출력 처리 ==================
+
+static void print_help(void)
+{
+    uart_write_str(
+        "\r\n====== COMMAND HELP =====\r\n"
+        "h, help  : Show this help\r\n"
+        "\r\n"
+        "Kn       : Suspend task #nn (K1->01_LEDTask, K11->11_LVGL)\r\n"
+        "Rn       : Resume  task #nn (R1->01_LEDTask)\r\n"
+        "KA       : Suspend ALL numbered tasks (except protected)\r\n"
+        "RA       : Resume  ALL numbered tasks (except protected)\r\n"
+        "Xn       : Soft-restart task #nn (Suspend+Resume, protected skip)\r\n"
+        "XA       : Soft-restart ALL numbered tasks (except protected)\r\n"
+        "\r\n"
+        "TC       : Reset CPU runtime counters baseline (for 't')\r\n"
+        "s        : Show PID + target status\r\n"
+        "t        : Show FreeRTOS task stats (St=R/S)\r\n"
+        "\r\n"
+        "Pxxx     : Set Kp (P120 -> 0.120)\r\n"
+        "Ixxx     : Set Ki (I050 -> 0.050)\r\n"
+        "Dxxx     : Set Kd (D010 -> 0.010)\r\n"
+        "Gxx      : Set target position (G35 -> 35000 ADC)\r\n"
+        "R, RUN   : Move to saved G target\r\n"
+        "\r\n"
+        "v0       : SINE MODE OFF (production controller)\r\n"
+        "v1       : SINE MODE ON: 1Hz home<->peak closed-loop\r\n"
+        "\r\n"
+        "========================\r\n"
+    );
+}
+
+
+
+// ================== 사용자 명령 처리 ==================
+// ================== 사용자 명령 처리 ==================
+static void handle_user_command(const char *line)
+{
+    if (!line) return;
+
+    // 앞쪽 공백/탭 무시 ( " ka" 같은 것도 인식되도록 )
+    while (*line == ' ' || *line == '\t') {
+        line++;
+    }
+    if (line[0] == 0) return;
+
+    char cmd = line[0];
+
+    /* ====== KA / RA : 전체 Task 제어 ====== */
+
+    // ----- KA : 숫자로 시작하는 Task 전체 Suspend (보호 Task 제외) -----
+    if ((cmd == 'K' || cmd == 'k') &&
+        (line[1] == 'A' || line[1] == 'a') &&
+        (line[2] == 0))
+    {
+        TaskStatus_t *statusArr = gTaskStatus;
+        UBaseType_t n = uxTaskGetNumberOfTasks();
+        if (n > TASKSTAT_MAX) n = TASKSTAT_MAX;
+
+        n = uxTaskGetSystemState(statusArr, n, NULL);
+
+        int suspended = 0;
+        int skipped_protected = 0;
+
+        for (UBaseType_t i = 0; i < n; i++) {
+            const char *name = statusArr[i].pcTaskName;
+            if (!name) continue;
+
+            // 이름이 숫자로 시작하는 Task만 대상 ("1_LEDTask" 등)
+            if (!isdigit((unsigned char)name[0])) {
+                continue;
+            }
+
+            if (is_task_protected_name(name)) {
+                skipped_protected++;
+                continue;
+            }
+
+            if (statusArr[i].eCurrentState != eSuspended) {
+                vTaskSuspend(statusArr[i].xHandle);
+                suspended++;
+            }
+        }
+
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "\r\nKA: suspended=%d, protected=%d\r\n",
+                 suspended, skipped_protected);
+        uart_write_str(buf);
+        return;
+    }
+
+    // ----- RA : 숫자로 시작하는 Task 전체 Resume (보호 Task 제외) -----
+    if ((cmd == 'R' || cmd == 'r') &&
+        (line[1] == 'A' || line[1] == 'a') &&
+        (line[2] == 0))
+    {
+        TaskStatus_t *statusArr = gTaskStatus;
+        UBaseType_t n = uxTaskGetNumberOfTasks();
+        if (n > TASKSTAT_MAX) n = TASKSTAT_MAX;
+
+        n = uxTaskGetSystemState(statusArr, n, NULL);
+
+        int resumed = 0;
+        int skipped_protected = 0;
+
+        for (UBaseType_t i = 0; i < n; i++) {
+            const char *name = statusArr[i].pcTaskName;
+            if (!name) continue;
+
+            // 이름이 숫자로 시작하는 Task만 대상
+            if (!isdigit((unsigned char)name[0])) {
+                continue;
+            }
+
+            if (is_task_protected_name(name)) {
+                skipped_protected++;
+                continue;
+            }
+
+            if (statusArr[i].eCurrentState == eSuspended) {
+                vTaskResume(statusArr[i].xHandle);
+                resumed++;
+            }
+        }
+
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "\r\nRA: resumed=%d, protected=%d\r\n",
+                 resumed, skipped_protected);
+        uart_write_str(buf);
+        return;
+    }
+
+    /* ====== Kx / Rx : 개별 Task 제어 ====== */
+
+    // ----- Kx : 특정 번호 Task Suspend -----
+    if (cmd == 'K' || cmd == 'k')
+    {
+        const char *numstr = &line[1];
+        if (*numstr == 0 || !isdigit((unsigned char)*numstr)) {
+            uart_write_str("\r\nERR: Kx -> x는 숫자여야 합니다\r\n");
+            return;
+        }
+
+        int idx = atoi(numstr);
+        if (idx <= 0) {
+            uart_write_str("\r\nERR: Task index must be > 0\r\n");
+            return;
+        }
+
+        TaskHandle_t h = find_task_by_index(idx);
+        if (h == NULL) {
+            uart_write_str("\r\nERR: 해당 번호의 Task를 찾을 수 없습니다\r\n");
+            return;
+        }
+
+        const char *name = get_task_name_by_handle(h);
+        if (is_task_protected_name(name)) {
+            uart_write_str("\r\nERR: 보호 Task는 Suspend 할 수 없습니다\r\n");
+            return;
+        }
+
+        vTaskSuspend(h);
+
+        char buf[64];
+        snprintf(buf, sizeof(buf),
+                 "\r\nK%d: Task suspended\r\n", idx);
+        uart_write_str(buf);
+        return;
+    }
+
+    // ----- Xx : 특정 번호 Task Soft-Restart (Suspend+Resume) -----
+    if (cmd == 'X' || cmd == 'x')
+    {
+        const char *numstr = &line[1];
+        if (*numstr == 0 || !isdigit((unsigned char)*numstr)) {
+            uart_write_str("\r\nERR: Xx -> x는 숫자여야 합니다\r\n");
+            return;
+        }
+
+        int idx = atoi(numstr);
+        if (idx <= 0) {
+            uart_write_str("\r\nERR: Task index must be > 0\r\n");
+            return;
+        }
+
+        TaskHandle_t h = find_task_by_index(idx);
+        if (h == NULL) {
+            uart_write_str("\r\nERR: 해당 번호의 Task를 찾을 수 없습니다\r\n");
+            return;
+        }
+
+        const char *name = get_task_name_by_handle(h);
+        if (is_task_protected_name(name)) {
+            uart_write_str("\r\nERR: 보호 Task는 X로 재시작할 수 없습니다\r\n");
+            return;
+        }
+
+        eTaskState st = eTaskGetState(h);
+        const char *msg_mode = NULL;
+
+        if (st == eSuspended) {
+            vTaskResume(h);
+            msg_mode = "resumed (was suspended)";
+        } else {
+            vTaskSuspend(h);
+            vTaskResume(h);
+            msg_mode = "soft-restarted (Suspend+Resume)";
+        }
+
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "\r\nX%d: Task %s\r\n", idx, msg_mode);
+        uart_write_str(buf);
+        return;
+    }
+
+
+    // ----- Rx : 특정 번호 Task Resume -----
+    if ((cmd == 'R' || cmd == 'r') &&
+        isdigit((unsigned char)line[1]))
+    {
+        const char *numstr = &line[1];
+        int idx = atoi(numstr);
+        if (idx <= 0) {
+            uart_write_str("\r\nERR: Task index must be > 0\r\n");
+            return;
+        }
+
+        TaskHandle_t h = find_task_by_index(idx);
+        if (h == NULL) {
+            uart_write_str("\r\nERR: 해당 번호의 Task를 찾을 수 없습니다\r\n");
+            return;
+        }
+
+        // 보호 Task라도 Resume은 허용
+        vTaskResume(h);
+
+        char buf[64];
+        snprintf(buf, sizeof(buf),
+                 "\r\nR%d: Task resumed\r\n", idx);
+        uart_write_str(buf);
+        return;
+    }
+
+    // ----- XA : 숫자로 시작하는 Task 전체 Soft-Restart (Suspend+Resume) -----
+        if ((cmd == 'X' || cmd == 'x') &&
+            (line[1] == 'A' || line[1] == 'a') &&
+            (line[2] == 0))
+        {
+            TaskStatus_t *statusArr = gTaskStatus;
+            UBaseType_t n = uxTaskGetNumberOfTasks();
+            if (n > TASKSTAT_MAX) n = TASKSTAT_MAX;
+
+            n = uxTaskGetSystemState(statusArr, n, NULL);
+
+            int restarted = 0;
+            int resumed_only = 0;
+            int skipped_protected = 0;
+
+            for (UBaseType_t i = 0; i < n; i++) {
+                const char *name = statusArr[i].pcTaskName;
+                if (!name) continue;
+
+                // 숫자로 시작하는 Task만 대상
+                if (!isdigit((unsigned char)name[0])) {
+                    continue;
+                }
+
+                if (is_task_protected_name(name)) {
+                    skipped_protected++;
+                    continue;
+                }
+
+                TaskHandle_t h = statusArr[i].xHandle;
+                eTaskState st = eTaskGetState(h);
+
+                if (st == eSuspended) {
+                    vTaskResume(h);
+                    resumed_only++;
+                } else {
+                    vTaskSuspend(h);
+                    vTaskResume(h);
+                    restarted++;
+                }
+            }
+
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     "\r\nXA: restarted=%d, resumed_only=%d, protected=%d\r\n",
+                     restarted, resumed_only, skipped_protected);
+            uart_write_str(buf);
+            return;
+        }
+
+        /* ====== TC : CPU 런타임 카운터 기준 리셋 ====== */
+        if ((cmd == 'T' || cmd == 't') &&
+            (line[1] == 'C' || line[1] == 'c') &&
+            (line[2] == 0))
+        {
+            TaskCpu_ResetAllBaselines();
+            uart_write_str("\r\nTC: CPU counters baseline reset for 't' stats\r\n");
+            return;
+        }
+
+
+
+        //=== 기존 명령 =====
+
+    // --------- HELP: h / help ----------
+    if ((cmd == 'h' || cmd == 'H') ||
+        (strcmp(line, "help") == 0) ||
+        (strcmp(line, "HELP") == 0))
+    {
+        print_help();
+        return;
+    }
+
+    // --------- PID 설정: P / I / D ----------
+    if (cmd == 'P' || cmd == 'p' ||
+        cmd == 'I' || cmd == 'i' ||
+        cmd == 'D' || cmd == 'd')
+    {
+        const char *numstr = &line[1];
+        if (*numstr == 0) {
+            uart_write_str("\r\nERR: no number\r\n");
+            return;
+        }
+
+        long val = strtol(numstr, NULL, 10);   // 10진수
+
+        float kp, ki, kd;
+#if USE_LINEAR_ACTUATOR
+        LA_PID_GetGains(&kp, &ki, &kd);
+#else
+        VCA_PID_GetGains(&kp, &ki, &kd);
+#endif
+
+        if (cmd == 'P' || cmd == 'p') {
+            kp = (float)val / 1000.0f;
+        } else if (cmd == 'I' || cmd == 'i') {
+            ki = (float)val / 1000.0f;
+        } else { // D
+            kd = (float)val / 1000.0f;
+        }
+
+#if USE_LINEAR_ACTUATOR
+        LA_PID_SetGains(kp, ki, kd);
+#else
+        VCA_PID_SetGains(kp, ki, kd);
+#endif
+
+        char buf[96];
+        long kp_milli = (long)(kp * 1000.0f);
+        long ki_milli = (long)(ki * 1000.0f);
+        long kd_milli = (long)(kd * 1000.0f);
+
+        snprintf(buf, sizeof(buf),
+                 "\r\nPID updated: Kp=%ld/1000, Ki=%ld/1000, Kd=%ld/1000\r\n",
+                 kp_milli, ki_milli, kd_milli);
+
+        uart_write_str(buf);
+        return;
+    }
+
+    // --------- G 값만 세팅 (이동은 하지 않음) ----------
+    if (cmd == 'G' || cmd == 'g')
+    {
+        const char *numstr = &line[1];
+        if (*numstr == 0) {
+            uart_write_str("\r\nERR: no number\r\n");
+            return;
+        }
+
+        long gval = strtol(numstr, NULL, 10);  // 예: G150 → 1.50mm
+        if (gval < 0)   gval = 0;
+        if (gval > 400) gval = 400;            // 최대 4.00mm
+
+        /* Gxxx = x.xx mm 깊이 — depth 는 3.5mm 잠금, 입력 무시 */
+        (void)gval;
+        float depth_mm = 3.5f;
+        g_needle_depth_mm = 3.5f;
+
+#if !USE_LINEAR_ACTUATOR
+        // pending도 갱신 (호환용)
+        s_vca_pending_target_adc = (uint16_t)(3300 + (long)(depth_mm * 10200.0f));
+#endif
+
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "\r\nG saved: G=%ld -> depth=%.2fmm\r\n",
+                 gval, (double)depth_mm);
+        uart_write_str(buf);
+        return;
+    }
+
+    // --------- RUN: 저장된 G 값으로 실제 이동 시작 ----------
+    // "RUN", "Run", "run", 또는 간단히 "R"/"r" 도 허용
+    if ((cmd == 'R' || cmd == 'r') &&
+        (line[1] == 0 || (line[1]=='U' || line[1]=='u')))
+    {
+        /* RUN: pending depth를 적용 (G 명령이 이미 g_needle_depth_mm 설정) */
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "\r\nRUN: depth=%.2fmm\r\n",
+                 (double)g_needle_depth_mm);
+        uart_write_str(buf);
+        return;
+    }
+
+    // --------- SINE MODE: closed-loop 1Hz sine (HOME ↔ PEAK) ----------
+#if !USE_LINEAR_ACTUATOR
+    extern volatile uint8_t g_vca_sine_mode;
+    if (cmd == 'V' || cmd == 'v')
+    {
+        const char *numstr = &line[1];
+        int f = atoi(numstr);   // v0=off, v1=on
+
+        if (f <= 0) {
+            g_vca_sine_mode = 0;
+            uart_write_str("\r\nSINE MODE OFF (production controller)\r\n");
+            return;
+        }
+
+        g_vca_sine_mode = 1;
+        uart_write_str("\r\nSINE MODE ON: 1Hz closed-loop (home ↔ home+26000)\r\n");
+        return;
+    }
+#endif /* !USE_LINEAR_ACTUATOR -- V mode */
+
+    // --------- 상태 출력: s / S ----------
+    if (cmd == 's' || cmd == 'S')
+    {
+#if USE_LINEAR_ACTUATOR
+        float kp, ki, kd;
+        LA_PID_GetGains(&kp, &ki, &kd);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "\r\n[LA-T8 STATUS]\r\n"
+                 "Kp=%.4f Ki=%.4f Kd=%.4f\r\n"
+                 "Pos=%.2fmm (ADC=%u) Target=%.2fmm\r\n"
+                 "PID out=%.3f active=%u hardlim=%u\r\n"
+                 "depth=%.2fmm state=%u err=%u\r\n",
+                 (double)kp, (double)ki, (double)kd,
+                 (double)g_la_pos_mm, (unsigned)g_la_pos_adc,
+                 (double)g_la_target_mm,
+                 (double)g_la_pid_output, g_la_pid_active, g_la_hard_limit,
+                 (double)g_needle_depth_mm, g_vca_state, g_hp_error);
+        uart_write_str(buf);
+#else
+        float kp, ki, kd;
+        VCA_PID_GetGains(&kp, &ki, &kd);
+        uint16_t cur_tgt = VCA_GetTargetADC();
+
+        char buf[192];
+        long kp_milli = (long)(kp * 1000.0f);
+        long ki_milli = (long)(ki * 1000.0f);
+        long kd_milli = (long)(kd * 1000.0f);
+
+        snprintf(buf, sizeof(buf),
+                 "\r\n[PID STATUS]\r\n"
+                 "Kp          = %ld/1000\r\n"
+                 "Ki          = %ld/1000\r\n"
+                 "Kd          = %ld/1000\r\n"
+                 "G(pending)  = %u (ADC)\r\n"
+                 "Target(NOW) = %u (ADC)\r\n",
+                 kp_milli, ki_milli, kd_milli,
+                 (unsigned)s_vca_pending_target_adc,
+                 (unsigned)cur_tgt);
+        uart_write_str(buf);
+#endif
+        return;
+    }
+
+    uart_write_str("\r\nUnknown cmd\r\n");
+}
+
+
+static int task_sort_key(const TaskStatus_t *ts)
+{
+    const char *name = ts->pcTaskName;
+    if (strncmp(name, "IDLE", 4) == 0)     return -1;      // 최상단
+    if (!name || name[0] == 0) return 1000000;
+    if (strncmp(name, "Tmr Svc", 7) == 0)  return 1000001; // 최하단
+
+    // 번호로 시작하면 그 번호를 key로
+    if (name[0] >= '0' && name[0] <= '9') {
+        int v = 0;
+        int i = 0;
+        while (name[i] >= '0' && name[i] <= '9') {
+            v = v * 10 + (name[i] - '0');
+            i++;
+        }
+        // "12_" 또는 "12" 형태만 번호로 인정
+        if (name[i] == '_' || name[i] == '\0') return v;
+    }
+
+    // 나머지는 뒤로 (IDLE/Tmr Svc 포함)
+    // 필요하면 여기서 IDLE=999998, Tmr=999999 같이 더 세밀하게 가능
+    return 999999;
+}
+
+__attribute__((unused))
+static void sort_task_status(TaskStatus_t *arr, UBaseType_t n)
+{
+    // 간단한 선택정렬(작은 n에서 충분)
+    for (UBaseType_t i = 0; i + 1 < n; i++) {
+        UBaseType_t min = i;
+        int kmin = task_sort_key(&arr[min]);
+        for (UBaseType_t j = i + 1; j < n; j++) {
+            int kj = task_sort_key(&arr[j]);
+            if (kj < kmin) {
+                min = j;
+                kmin = kj;
+            }
+        }
+        if (min != i) {
+            TaskStatus_t tmp = arr[i];
+            arr[i] = arr[min];
+            arr[min] = tmp;
+        }
+    }
+}
+
+
+// ================== 통계용 헬퍼 ==================
+static void print_task_stats(UART_HandleTypeDef *huart)
+{
+    (void)huart;
+
+    TaskStatus_t *statusArr = gTaskStatus;
+    UBaseType_t n = uxTaskGetNumberOfTasks();
+    if (n > TASKSTAT_MAX) n = TASKSTAT_MAX;
+
+    configRUN_TIME_COUNTER_TYPE totalRunTime = 0;
+    n = uxTaskGetSystemState(statusArr, n, &totalRunTime);
+
+    if (!gBaseValid) {
+        TaskCpu_ResetAllBaselines();
+        uart_write_str("\r\n[TASK STATS] primed. Press t again.\r\n");
+        return;
+    }
+
+    uint32_t dTotal = (uint32_t)(totalRunTime - gBaseTotalRunTime);
+    if (dTotal == 0) dTotal = 1;
+
+    uart_write_str("\r\nName              Prio St   CPU%   HWM(bytes)   StackFree\r\n");
+    uart_write_str(  "--------------------------------------------------------------\r\n");
+
+    /* ── 마스터 태스크 목록 (번호순 출력, 비활성 포함) ── */
+    static const char * const all_names[] = {
+        "IDLE",
+        "00_UARTCmd",
+        "01_LEDTask",
+        "02_SysMonTask",
+        "03_ADS7041_U2",     /* 비활성 */
+        "04_ADXL345_U2",     /* 비활성 */
+        "05_ADXL345_U1",
+        "06_RS485",
+        "07_ADS8325_Acq",
+        "08_HPSwitch",
+        "09_Speaker",
+        "10_Default",
+        "11_LVGL",
+        "Tmr Svc",
+    };
+    const int all_cnt = (int)(sizeof(all_names) / sizeof(all_names[0]));
+
+    for (int t = 0; t < all_cnt; t++) {
+        /* statusArr에서 이름 검색 */
+        int found = -1;
+        for (UBaseType_t i = 0; i < n; i++) {
+            if (strcmp(statusArr[i].pcTaskName, all_names[t]) == 0) {
+                found = (int)i;
+                break;
+            }
+        }
+
+        char line[96];
+        if (found >= 0) {
+            /* 활성 태스크: 실제 통계 출력 */
+            uint32_t dTask = TaskCpu_GetDeltaCounter(&statusArr[found]);
+            uint32_t cpu10 = (uint32_t)((1000ULL * (uint64_t)dTask) / (uint64_t)dTotal);
+            char st = (statusArr[found].eCurrentState == eSuspended) ? 'S' : 'R';
+
+            snprintf(line, sizeof(line),
+                     "%-16s %4lu  %c %6lu.%1lu %9u %9u\r\n",
+                     statusArr[found].pcTaskName,
+                     (unsigned long)statusArr[found].uxBasePriority,
+                     st,
+                     (unsigned long)(cpu10 / 10), (unsigned long)(cpu10 % 10),
+                     (unsigned)(statusArr[found].usStackHighWaterMark * sizeof(StackType_t)),
+                     (unsigned)statusArr[found].usStackHighWaterMark);
+        } else {
+            /* 비활성 태스크: N 상태 표시 */
+            snprintf(line, sizeof(line),
+                     "%-16s    -  N       -         -         -\r\n",
+                     all_names[t]);
+        }
+        uart_write_str(line);
+    }
+}
+
+
+static void print_heap_stats(void)
+{
+    char buf[96];
+
+#if (configUSE_HEAP_SCHEME == 4 || configUSE_HEAP_SCHEME == 5)
+    HeapStats_t hs;
+    vPortGetHeapStats(&hs);
+    snprintf(buf, sizeof(buf),
+             "Heap Free(bytes):      %lu\r\n"
+             "Heap MinEverFree(bytes): %lu\r\n",
+             (unsigned long)hs.xAvailableHeapSpaceInBytes,
+             (unsigned long)hs.xMinimumEverFreeBytesRemaining);
+#else
+    extern size_t xPortGetFreeHeapSize(void);
+    extern size_t xPortGetMinimumEverFreeHeapSize(void);
+    snprintf(buf, sizeof(buf),
+             "Heap Free(bytes):      %lu\r\n"
+             "Heap MinEverFree(bytes): %lu\r\n",
+             (unsigned long)xPortGetFreeHeapSize(),
+             (unsigned long)xPortGetMinimumEverFreeHeapSize());
+#endif
+    uart_write_str(buf);
+}
+
+// ================== RX 큐 상태 조회 (외부용) ==================
+size_t UART_Cmd_GetRxQueueFree(void)
+{
+    if (s_rxq == NULL) return 0;
+    return (size_t)uxQueueSpacesAvailable(s_rxq);
+}
+
+size_t UART_Cmd_GetRxQueueLength(void)
+{
+    return (size_t)RXQ_LEN;
+}
+
+// ================== 로컬 유틸 ==================
+static void uart_write_str(const char *s)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t*)s, (uint16_t)strlen(s), HAL_MAX_DELAY);
+}
+
+static void uart_write_len(const uint8_t *buf, size_t n)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t*)buf, (uint16_t)n, HAL_MAX_DELAY);
+}
+
+static void uart_send_data(const uint8_t *buf, uint16_t len)
+{
+    uart_write_len(buf, (size_t)len);
+}
+
+static void uart_echo_byte(uint8_t ch)
+{
+    if (ch == '\r' || ch == '\n') {
+        const char crlf[2] = {'\r','\n'};
+        uart_send_data((const uint8_t*)crlf, 2);
+    } else if (ch == 0x08 || ch == 0x7F) { /* Backspace/DEL */
+        const char bs_seq[3] = {'\b',' ','\b'};
+        uart_send_data((const uint8_t*)bs_seq, 3);
+    } else {
+        uart_send_data(&ch, 1);
+    }
+}
+
+// ================== RX 콜백 ==================
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        BaseType_t xHptw = pdFALSE;
+        xQueueSendFromISR(s_rxq, &s_rx_byte, &xHptw);
+        HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1); // 재예약 필수
+        portYIELD_FROM_ISR(xHptw);
+    }
+}
+
+/* surge/burst 노이즈 시 framing/parity/noise/overrun 에러 발생.
+ * HAL 이 RX IT 자동 비활성화하므로 클리어 후 IT 재시작 필요.
+ * H5: ICR 로 클리어. USART2 는 polling 방식이라 별도 처리 안 함. */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        USART1->ICR = USART_ICR_PECF | USART_ICR_FECF | USART_ICR_NECF | USART_ICR_ORECF;
+        HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1);
+    }
+}
+
+// ================== 초기화 (한 번만) ==================
+void UART_Cmd_Init(void)
+{
+    if (sUartCmdTaskHandle != NULL) return; // 중복 생성 방지
+
+    s_rxq = xQueueCreate(RXQ_LEN, sizeof(uint8_t));
+    configASSERT(s_rxq != NULL);
+
+    // UART1 RX 인터럽트 시작
+    HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1);
+
+    // Command Task 생성 (FreeRTOS native)
+    // NOTE: 't' 명령/printf/snprintf 등으로 스택을 꽤 사용하므로 여유 있게.
+    // xTaskCreate의 stackDepth는 'words' 단위입니다( Cortex-M: 1word=4bytes ).
+    xTaskCreate(UART_CmdTask, "00_UARTCmd", 128*3, NULL,
+                osPriorityNormal, &sUartCmdTaskHandle);
+}
+
+// ================== Command Task ==================
+void UART_CmdTask(void *arg)
+{
+    (void)arg;
+    char   linebuf[CMD_LINE_MAX];
+    size_t linelen = 0;
+    bool   last_was_nl = false;
+
+    // RTOS/USART 초기화가 끝난 후 콘솔 화면 정리 + 배너 + 프롬프트
+    osDelay(200);  // 200ms 정도 여유
+    Terminal_ClearScreenAndBanner();
+
+    // ===== 리셋 직후: Task Stats를 자동 1회 출력 =====
+    TaskCpu_ResetAllBaselines();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    uart_write_str("\r\n[TASK STATS]\r\n");
+    print_task_stats(&huart1);
+    print_heap_stats();
+    uart_write_str("> ");
+
+    for (;;)
+    {
+        /* ===== V MODE 2Hz OSCILLATION (VCA only) ===== */
+#if !USE_LINEAR_ACTUATOR
+    	if (s_vca_vmode_enable)
+    	{
+    	    uint32_t now = osKernelGetTickCount();
+
+    	    if (now - s_vca_v_last_tick >= s_vca_v_half_period_ms)
+    	    {
+    	        s_vca_v_last_tick = now;
+
+    	        static bool v_dir = false;
+    	        v_dir = !v_dir;
+
+    	        if (v_dir)
+    	            VCA_SetTargetADC(s_vca_v_high);  // 45k
+    	        else
+    	            VCA_SetTargetADC(s_vca_v_low);   // 25k
+    	    }
+    	}
+#endif
+
+
+
+        // === UART 입력 (10ms 타임아웃) ===
+        uint8_t ch;
+        if (xQueueReceive(s_rxq, &ch, pdMS_TO_TICKS(10)) != pdTRUE) {
+            // 입력이 없으면 다시 V MODE만 체크
+            continue;
+        }
+
+        // 개행 처리: CR, LF 모두 라인 종료로 인정
+        if (ch == '\r' || ch == '\n') {
+            // CR 다음 바로 LF(또는 반대)면 두 번째는 무시
+            if (last_was_nl) {
+                last_was_nl = false;
+                continue;
+            }
+            last_was_nl = true;
+
+            uart_echo_byte(ch);  // 화면엔 항상 \r\n
+
+            linebuf[linelen] = 0;
+
+            // ---- 명령 실행 ----
+            if (linelen == 1 &&
+                (linebuf[0] == 't' || linebuf[0] == 'T'))
+            {
+                // 1초 고정 윈도우로 측정 (t 출력 때문에 UARTCmd% 튀는 현상 완화)
+                TaskCpu_ResetAllBaselines();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+
+                uart_write_str("\r\n[TASK STATS]\r\n");
+                print_task_stats(&huart1);
+                print_heap_stats();
+            }
+            else if (linelen > 0)
+            {
+                // ✅ 이 줄이 있어야 h/help, P/I/D/G/RUN/v/s, TC 등이 동작합니다
+                handle_user_command(linebuf);
+            }
+
+            // 다음 줄 준비 + 프롬프트
+            linelen = 0;
+            uart_write_str("> ");
+            continue;
+
+
+        } else {
+            last_was_nl = false;     // 일반 문자면 NL 연속 상태 해제
+        }
+
+        // 편집키: Backspace/DEL
+        if (ch == 0x08 || ch == 0x7F) {
+            if (linelen > 0) {
+                linelen--;
+                uart_echo_byte(ch);
+            }
+            continue;
+        }
+
+        // 인쇄 가능 문자만 수집
+        if (ch >= 0x20 && ch <= 0x7E) {
+            if (linelen < CMD_LINE_MAX - 1) {
+                linebuf[linelen++] = (char)ch;
+                uart_echo_byte(ch);
+            } else {
+                // 넘치면 벨 등으로 알릴 수도 있음
+            }
+        }
+    }
+}
