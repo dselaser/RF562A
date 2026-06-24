@@ -23,6 +23,8 @@ extern uint16_t VCA_GetTargetADC(void);
 extern volatile float g_needle_depth_mm;
 extern volatile uint8_t g_vca_state;
 extern volatile uint8_t g_hp_error;
+extern volatile uint8_t g_gui_ready;   /* 1=TREAT(스위치 활성) — 벤치 RUN 으로 set */
+extern volatile uint32_t g_plot_mute_until_ms;  /* RX 중 플로터 묵음(공유 UART1 충돌 회피) */
 extern osThreadId_t ads8325TaskHandle;
 
 // 외부 UART 핸들 (명령 포트는 UART1)
@@ -599,10 +601,10 @@ static void handle_user_command(const char *line)
         if (gval < 0)   gval = 0;
         if (gval > 400) gval = 400;            // 최대 4.00mm
 
-        /* Gxxx = x.xx mm 깊이 — depth 는 3.5mm 잠금, 입력 무시 */
-        (void)gval;
-        float depth_mm = 3.5f;
-        g_needle_depth_mm = 3.5f;
+        /* Gxxx = x.xx mm 깊이 — 벤치 깊이제어 테스트용 적용 (3.5mm 잠금 해제).
+         *  gval 0~400 → 0.00~4.00mm. OP_ machine 이 [0.5,3.5] 로 재클램프.       */
+        float depth_mm = (float)gval / 100.0f;
+        g_needle_depth_mm = depth_mm;
 
 #if !USE_LINEAR_ACTUATOR
         // pending도 갱신 (호환용)
@@ -620,12 +622,23 @@ static void handle_user_command(const char *line)
     // --------- RUN: 저장된 G 값으로 실제 이동 시작 ----------
     // "RUN", "Run", "run", 또는 간단히 "R"/"r" 도 허용
     if ((cmd == 'R' || cmd == 'r') &&
-        (line[1] == 0 || (line[1]=='U' || line[1]=='u')))
+        (line[1] == 0 || line[1]=='0' || (line[1]=='U' || line[1]=='u')))
     {
-        /* RUN: pending depth를 적용 (G 명령이 이미 g_needle_depth_mm 설정) */
+        /* RUN: TREAT(Ready) 진입 — 벤치 단독 테스트용.
+         *  OP_ machine 은 g_gui_ready=1 일 때만 핸드피스 스위치를 받는다
+         *  (my_tasks.c:1942, "STBY 에서는 스위치 무시"). Main 보드 없는 벤치에선
+         *  @R RS485 가 안 오므로 여기서 직접 Ready 로 만들어 스위치를 살린다.
+         *  깊이는 G 명령이 이미 g_needle_depth_mm 에 설정. 스위치 누르면 PUSH→
+         *  설정 depth 정착, 떼면 home 복귀. (정지하려면 'R0' 또는 재부팅)        */
+        if (line[1] == '0') {
+            g_gui_ready = 0;
+            uart_write_str("\r\nSTANDBY: switch disabled (g_gui_ready=0)\r\n");
+            return;
+        }
+        g_gui_ready = 1;
         char buf[96];
         snprintf(buf, sizeof(buf),
-                 "\r\nRUN: depth=%.2fmm\r\n",
+                 "\r\nRUN: READY (switch live) depth=%.2fmm\r\n",
                  (double)g_needle_depth_mm);
         uart_write_str(buf);
         return;
@@ -896,6 +909,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     if (huart->Instance == USART1) {
         BaseType_t xHptw = pdFALSE;
         xQueueSendFromISR(s_rxq, &s_rx_byte, &xHptw);
+        g_plot_mute_until_ms = HAL_GetTick() + 1500U;  /* 입력 중 플로터 묵음 → 콘솔 클린 */
         HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1); // 재예약 필수
         portYIELD_FROM_ISR(xHptw);
     }
@@ -974,6 +988,13 @@ void UART_CmdTask(void *arg)
 #endif
 
 
+
+        /* RX self-heal: 공유 UART1 에서 blocking 플로터 TX 가 HAL lock 을 쥔 순간
+         *  RxCplt 의 재무장이 HAL_BUSY 로 실패하면 RX 가 영구히 죽어 명령이 무반응이
+         *  된다. 매 루프(≤10ms) RX 가 비무장이면 다시 무장해 자동 복구한다. */
+        if (huart1.RxState != HAL_UART_STATE_BUSY_RX) {
+            HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1);
+        }
 
         // === UART 입력 (10ms 타임아웃) ===
         uint8_t ch;

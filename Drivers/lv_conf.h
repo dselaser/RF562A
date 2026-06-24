@@ -78,10 +78,10 @@
  *====================*/
 
 /*Default display refresh period. LVG will redraw changed areas with this period time*/
-#define LV_DISP_DEF_REFR_PERIOD 15      /*[ms]*/
+#define LV_DISP_DEF_REFR_PERIOD 10      /*[ms]*/   /* 15→10: 화면 갱신 지연 단축 (motor idle 시 체감 응답↑, motor 중엔 LVGL Low로 굶어 SPI 미증가=EMI 안전) */
 
 /*Input device read period in milliseconds*/
-#define LV_INDEV_DEF_READ_PERIOD 10     /*[ms]*/
+#define LV_INDEV_DEF_READ_PERIOD 5      /*[ms]*/   /* 10→5: 터치 샘플 2배 → 슬라이더 드래그 추종 부드럽게 (touch I2C 전용 hi2c1) */
 
 /*Use a custom tick source that tells the elapsed time in milliseconds.
  *It removes the need to manually update the tick with `lv_tick_inc()`)*/

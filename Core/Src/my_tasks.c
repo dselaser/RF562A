@@ -47,6 +47,7 @@
 #include "tle9201.h"
 #include "motor_hal.h"
 #include "vca_control.h"
+#include "vca_adrc.h"     /* VCA cascaded ADRC (USE_ADRC 게이트, 기본 0) */
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
@@ -92,6 +93,7 @@ volatile uint8_t  g_i_meas_updated = 0; // Loop2가 새 전류값 쓸 때 1, ISR
 /* Loop-2 위치 */
 volatile uint16_t g_vca_pos_adc = 0;   /* 제어+표시용 (모터 중 동결) */
 volatile uint16_t g_vca_pos_raw = 0;   /* median only  (디버그) */
+volatile float    g_vca_pos_mm  = 0.0f;/* g_vca_pos_adc → 실제 돌출 mm (벤치 캘 환산) */
 #else  /* USE_LINEAR_ACTUATOR */
 /* ── LA-T8 위치 제어 전역 변수 ── */
 volatile float    g_la_pos_mm     = 0.0f;  /* 현재 위치 (mm)         */
@@ -133,7 +135,7 @@ volatile uint8_t  g_hp_locked  = 0;  /* 1=잠금 (스위치 비활성+로고) */
 #if VCA_LED_SENSOR_TEST
 volatile uint8_t  g_vca_sine_mode = 1; /* LED 센서 검증: 부팅 즉시 open-loop sine 모드 */
 #else
-volatile uint8_t  g_vca_sine_mode = 0; /* 1=sine test, 0=production state machine (default) */
+volatile uint8_t  g_vca_sine_mode = 0; /* production state machine (벤치 sine 진단 종료 2026-06-24). 1=부팅 즉시 open-loop 1Hz sine 진단 모드. */
 #endif
 
 /* ── Main 명령 상태 추적 어레이 ────────────────────────────────────────────
@@ -158,6 +160,10 @@ volatile uint8_t  g_op_reset_request  = 0;
 /* @L1 (1-pin → bipolar 복귀) 후 자동 PUSH (depth=3.5 까지 이동) 종료 시각
  *  cold motor break-away — depth ≤ 3mm 에서 미동작 회피.                    */
 volatile uint32_t g_auto_push_until_ms = 0;
+/* 공유 UART1 플로터 묵음 시각 — 사용자가 명령 입력 중(최근 RX)이면 플로터
+ *  TX 를 잠시 멈춰 콘솔을 깨끗이 하고 TX/RX HAL lock 충돌을 회피한다.
+ *  uart_cmd.c 의 RxCplt 가 HAL_GetTick()+1500 으로 갱신, 입력 멈추면 자동 재개. */
+volatile uint32_t g_plot_mute_until_ms = 0;
 /* 치료 펄스 완료 후 강제 retract 플래그 — Main 이 @F0 송신 시 set
  *  HP/FOOT 모드 무관하게 needle home 으로 복귀 강제
  *  사용자 switch 릴리즈 검출되면 자동 clear                                  */
@@ -374,13 +380,24 @@ void Loop1_TIM6_ISR_Handler(void)
     if (i_tgt > i_limit) i_tgt = i_limit;
     if (i_tgt > I_MAX_MA) i_tgt = I_MAX_MA;  /* 절대 최대 */
 
-    /* ── 4. PI 전류 제어 ─────────────────────────────────────────────── */
-    /* 측정값도 방향 반영 (PUSH 방향 양수 기준) */
-    /* ── 4. PI 전류 제어 — 새 측정값 있을 때만 계산 (1ms 갱신 대응) ── */
+    /* ── 4. 전류 제어 — 새 측정값 있을 때만 계산 (1ms 갱신 대응) ──────────
+     *  측정값도 구동방향 반영(PUSH 방향 양수 기준). USE_ADRC 로 PI/ADRC 선택. */
     if (g_i_meas_updated) {
         g_i_meas_updated = 0;  /* 플래그 클리어 */
 
         int32_t i_meas_dir = (s_l1_dir == 1) ? g_i_meas_mA : -g_i_meas_mA;
+
+#if USE_ADRC
+        /* ── 4a. ADRC 전류 제어 (구동방향 크기) ──────────────────────────
+         *  ADRC signed duty 의 양수부만 크기로 사용 — 방향(DIR)은 Loop2 관리.
+         *  u<0(역구동 요구)은 0 클램프: 1-쿼드런트 한계, Phase1b 4-쿼드런트서 해소.
+         *  revert: vca_adrc.h 의 USE_ADRC → 0. */
+        VCAdrc_SetCurrentRef((float)i_tgt * 0.001f);                     /* mA→A */
+        float u_adrc   = VCAdrc_CurrentStep((float)i_meas_dir * 0.001f); /* signed duty */
+        float duty_cmd = (u_adrc > 0.0f) ? u_adrc : 0.0f;
+        if (duty_cmd > 1.0f) duty_cmd = 1.0f;
+#else
+        /* ── 4b. PI 전류 제어 ──────────────────────────────────────────── */
         float   err_f      = (float)(i_tgt - i_meas_dir);
 
         /* 비례항 */
@@ -396,6 +413,7 @@ void Loop1_TIM6_ISR_Handler(void)
         /* duty 클램프 */
         if (duty_cmd < 0.0f) duty_cmd = 0.0f;
         if (duty_cmd > 1.0f) duty_cmd = 1.0f;
+#endif
 
         s_duty_l1  = duty_cmd;
         g_duty_dbg = duty_cmd;
@@ -422,6 +440,9 @@ static void Loop1_Start(int32_t i_target_mA, bool boost)
     s_boost_cnt  = 0U;
     s_boosting   = boost;
     g_i_target_mA = i_target_mA;
+#if USE_ADRC
+    VCAdrc_EnableCurrent(true);   /* bumpless: ISR 가 step 하기 전에 옵저버 재seed */
+#endif
     s_l1_enable  = true;
 }
 
@@ -431,6 +452,9 @@ static void Loop1_Start(int32_t i_target_mA, bool boost)
 static void Loop1_Stop(void)
 {
     s_l1_enable   = false;
+#if USE_ADRC
+    VCAdrc_EnableCurrent(false);  /* ISR step 중단(s_l1_enable=false) 후 비활성 */
+#endif
     g_i_target_mA = 0;
     s_i_err_acc   = 0.0f;
 }
@@ -684,22 +708,75 @@ volatile uint16_t g_vca_adc_home = 25000;        /* fallback 초기값 */
 /* ── 깊이 → ADC 변환 (HOME은 런타임 캘리브레이션 값) ───────────────────── */
 #define DEPTH_MM_TO_ADC(mm)   ((int32_t)(VCA_ADC_HOME + (mm) * VCA_ADC_PER_MM))
 
-/* ── 측정값 기반 위치 교정 LUT ─────────────────────────────────────────
- *  실측 사이클 #2 (LCD 설정 → 측정 mm, depth_correction 적용 후):
- *    0.5→X(미도달)  1.0→0.81  1.5→0.89  2.0→2.0✓  2.5→3.79  3.0→3.87  3.5→3.85
- *  분석:
- *    - 모터 마찰 floor ~0.8mm — 그 아래 도달 불가 (LCD 0.5는 ~0.8로 매핑)
- *    - internal 1.7 = sweet spot (정확히 2.0mm)
- *    - internal 1.6 → 0.89, internal 1.9 → 3.79 (transition zone 비선형)
- *    - 2.5~3.5 사이 internal 1.7~1.85의 좁은 윈도우에 분포
+/* ── ADC → 실제 돌출길이(mm) 변환 (반사형 위치센서 벤치 캘리브레이션) ───────
+ *  2026-06-23 실측 (절대 ADC ↔ 케이스 밖 돌출 mm):
+ *      25000→0.58  30000→1.40  35000→2.20  40000→3.03  41600→3.64
+ *  · 25k~40k 는 ~6122 cnt/mm 거의 선형, 40k 위 기울기 꺾임(2623 cnt/mm).
+ *  · HOME(니들 케이스 내부 후퇴=하드스톱) ≈ 16000.  0mm = 케이스 표면(돌출 시작),
+ *    음수 = 아직 케이스 안.  최저 캘 구간 기울기로 외삽하면 HOME ≈ -0.9mm.
+ *  · HOME 은 물리 하드스톱(부팅마다 동일 위치)이라, 반사율 드리프트로 ADC 가
+ *    통째로 밀리면 g_vca_adc_home 기준 평행이동으로 캘 곡선에 재정렬한다.
+ *    (auto-home 값이 비정상이면 평행이동 생략 → 순수 절대 LUT)
+ *  · 41.6k 위는 데이터 없어 clamp.
+ * ───────────────────────────────────────────────────────────────────────── */
+#define VCA_ADC_HOME_NOMINAL  (16000)   /* 캘리브레이션 당시 HOME(하드스톱) ADC */
+static const struct { uint16_t adc; float mm; } VCA_POS_CAL[] = {
+    {25000U, 0.58f}, {30000U, 1.40f}, {35000U, 2.20f},
+    {40000U, 3.03f}, {41600U, 3.64f},
+};
+#define VCA_POS_CAL_N ((int)(sizeof(VCA_POS_CAL)/sizeof(VCA_POS_CAL[0])))
+
+static float vca_adc_to_mm(uint16_t adc_in)
+{
+    /* HOME 하드스톱 기준 평행이동 (auto-home 정상 범위일 때만) */
+    int32_t home = (int32_t)g_vca_adc_home;
+    int32_t adc  = (int32_t)adc_in;
+    if (home > 13000 && home < 19000) {
+        adc -= (home - (int32_t)VCA_ADC_HOME_NOMINAL);
+    }
+
+    /* 최저 캘점 아래: 첫 구간 기울기로 외삽 (case 안 음수 허용) */
+    if (adc <= (int32_t)VCA_POS_CAL[0].adc) {
+        float slope = (VCA_POS_CAL[1].mm - VCA_POS_CAL[0].mm)
+                    / (float)((int32_t)VCA_POS_CAL[1].adc - (int32_t)VCA_POS_CAL[0].adc);
+        return VCA_POS_CAL[0].mm + slope * (float)(adc - (int32_t)VCA_POS_CAL[0].adc);
+    }
+    /* 최고 캘점 위: 데이터 없음 → clamp */
+    if (adc >= (int32_t)VCA_POS_CAL[VCA_POS_CAL_N - 1].adc) {
+        return VCA_POS_CAL[VCA_POS_CAL_N - 1].mm;
+    }
+    /* 구간 선형보간 */
+    for (int i = 0; i < VCA_POS_CAL_N - 1; i++) {
+        if (adc <= (int32_t)VCA_POS_CAL[i + 1].adc) {
+            float t = (float)(adc - (int32_t)VCA_POS_CAL[i].adc)
+                    / (float)((int32_t)VCA_POS_CAL[i + 1].adc - (int32_t)VCA_POS_CAL[i].adc);
+            return VCA_POS_CAL[i].mm + t * (VCA_POS_CAL[i + 1].mm - VCA_POS_CAL[i].mm);
+        }
+    }
+    return VCA_POS_CAL[VCA_POS_CAL_N - 1].mm;
+}
+
+/* ── 측정값 기반 위치 교정 LUT (2026-06-24 실측, 닫힌루프 HOLD) ──────────
+ *  내부 command(= identity 시절 슬라이더값) → 실제 니들 돌출(mm) 실측:
+ *    cmd 1.0→0.75  1.5→1.09  2.0→1.52  2.5→1.95  3.0→2.58  3.5→2.73
+ *  이 함수는 그 역(逆): "사용자가 원하는 실제 mm" → "그걸 내는 내부 command".
+ *    → GUI depth 값이 곧 실제 돌출 mm 가 되도록 교정.
+ *  도달 한계(실측 기반):
+ *    · 최저 ~0.75mm (cmd 1.0) — 마찰 floor. GUI 0.5 요청은 0.75mm 로 floor.
+ *    · 최대 ~2.73mm (cmd 3.5, 기구/스프링 포화). GUI 3.0·3.5 둘 다 2.73mm 로 saturate.
+ *    · 정확 교정 구간 = GUI 1.0~2.5 (실제 ~1.0~2.5mm).
+ *  ※ 데드밴드(±0.22mm)·EMA·마찰이 모두 실측값에 이미 반영 → 역보간만으로 교정 성립.
+ *  ※ 재교정: cmd→실측 표만 갱신하면 됨(lut_internal=command, lut_user=측정 actual).
  * ───────────────────────────────────────────────────────────────────── */
+/* ⚠ 2026-06-24: depth_seed_duty(직결표) + target=desired actual 로 대체.
+ *  더는 호출 안 됨(과거 GUI→command 역교정). 참고 보존, unused 경고 억제. */
+static float depth_correction(float user_mm) __attribute__((unused));
 static float depth_correction(float user_mm)
 {
-    /* 사용자 원함 → motor 내부 target
-     * identity 매핑 — pure-P + ramp 제어로 재교정 필요 (이전 LUT은 over-shoot 시절 inverse) */
-    static const float lut_user[]     = {0.5f, 1.0f, 1.5f, 2.0f, 2.5f, 3.0f, 3.5f};
-    static const float lut_internal[] = {0.5f, 1.0f, 1.5f, 2.0f, 2.5f, 3.0f, 3.5f};
-    const int N = 7;
+    /* user_mm = 원하는 실제 돌출(mm) → 반환 = motor 내부 command(mm) */
+    static const float lut_user[]     = {0.75f, 1.09f, 1.52f, 1.95f, 2.58f, 2.73f}; /* 실측 actual */
+    static const float lut_internal[] = {1.00f, 1.50f, 2.00f, 2.50f, 3.00f, 3.50f}; /* 내부 command */
+    const int N = 6;
     if (user_mm <= lut_user[0])     return lut_internal[0];
     if (user_mm >= lut_user[N - 1]) return lut_internal[N - 1];
     for (int i = 0; i < N - 1; i++) {
@@ -795,6 +872,35 @@ static float depth_to_duty(float depth_mm)
         }
     }
     return lut_duty[LIN_LUT_N - 1];
+}
+
+/* ══ 직접 깊이 시드: GUI 깊이(mm) → HOLD 평형 듀티 ════════════════════════
+ *  2026-06-24 재교정. depth_correction(GUI→command)+depth_to_duty(command→duty)
+ *  2겹 합성표를 1겹 직결표로 대체. 합성표 문제:
+ *    ① 윗구간 평평(GUI 2.0→0.220, 2.5→0.229: 데드밴드보다 작은 차 → 같은 깊이)
+ *    ② GUI 3.0/3.5 가 command 3.50 으로 클램프 → 같은 듀티(구분 불가)
+ *  하단(0.5~2.0)은 기존 합성값 그대로(0.190/0.194/0.204/0.220) → 잘 맞던 교정 보존.
+ *  상단(2.5/3.0/3.5)만 실측 기울기(≈+0.042 duty/mm)로 가파르게 + 각 단계 구분.
+ *  ★재교정 노브: 이 표 duty 만 수정. 얕으면↑/깊으면↓ (발열 상한 ≤0.40 권장). */
+#define SEED_LUT_N  7
+static const float seed_lut_gui[SEED_LUT_N]  = {
+    0.50f, 1.00f, 1.50f, 2.00f, 2.50f, 3.00f, 3.50f
+};
+static const float seed_lut_duty[SEED_LUT_N] = {
+    0.190f, 0.194f, 0.204f, 0.220f, 0.241f, 0.262f, 0.283f
+};
+static float depth_seed_duty(float gui_mm)
+{
+    if (gui_mm <= seed_lut_gui[0])              return seed_lut_duty[0];
+    if (gui_mm >= seed_lut_gui[SEED_LUT_N - 1]) return seed_lut_duty[SEED_LUT_N - 1];
+    for (int i = 0; i < SEED_LUT_N - 1; i++) {
+        if (gui_mm <= seed_lut_gui[i + 1]) {
+            float t = (gui_mm - seed_lut_gui[i])
+                    / (seed_lut_gui[i + 1] - seed_lut_gui[i]);
+            return seed_lut_duty[i] + t * (seed_lut_duty[i + 1] - seed_lut_duty[i]);
+        }
+    }
+    return seed_lut_duty[SEED_LUT_N - 1];
 }
 #define MOVE_TIMEOUT_MS       (500)   /* MOVE 시간 제한: ADC 동결 중 위치 전환 불가 → 타이머로 HOLD 전환 */
 
@@ -1152,6 +1258,11 @@ void HPSwitchTask_impl(void *argument)
     osDelay(50);
 
     VCA_Init();   /* 내부에서 TLE9201_SetPWM_Frequency(40000) 호출 */
+#if USE_ADRC
+    VCAdrc_Init();   /* ADRC 캐스케이드 초기화 (placeholder gain, 양 루프 disabled).
+                      *  ★ 활성 VCA 빌드(USE_LINEAR_ACTUATOR=0)는 이 함수가 컴파일됨.
+                      *  미호출 시 ADRC1/2 게인이 미초기화 → CurrentStep 출력 0/NaN. */
+#endif
     /* PWM 주파수: 20kHz (가청대 밖, 무음)
      *  진단 결과 (스코프): duty 1.0 시 motor 양단 ~9.5V 인가 중 = HW 한계.
      *  PWM 주파수는 duty<1.0 일 때만 force 영향 → duty 1.0 BURST 에선 무관.
@@ -1230,6 +1341,44 @@ void HPSwitchTask_impl(void *argument)
             osDelay(20);
         }
     }
+
+    /* ─── [벤치 전용] ADRC 내부 전류루프 bring-up 검증 ───────────────────────
+     *  생산 PUSH/MOVE/HOLD 경로는 전부 open-loop duty(VCA_SetDuty)이며 Loop1을
+     *  항상 Stop 시키므로, USE_ADRC=1 로 빌드해도 정상 동작 중에는 ADRC 전류루프가
+     *  단 한 번도 실행되지 않는다(TIM6 ISR 이 !s_l1_enable 에서 early-return).
+     *  → 내부 전류 ADRC 를 격리 검증하려고, 부팅 직후 이 태스크를 점유하여 PUSH
+     *    방향 전류 지령 사각파(LO↔HI)를 무한 인가한다. 니들은 풀돌출 하드스톱에
+     *    눌린 채 유지(기계적 운동 최소)되어 순수 전류 추종을 관찰할 수 있다.
+     *  관찰: CubeIDE Live Expressions / SWV 에 vcadrc_dbg_i_ref_A, vcadrc_dbg_i_meas_A
+     *        (필요시 vcadrc_dbg_u_signed, vcadrc_dbg_cur_z2_dist) 추가.
+     *  튜닝: 추종이 느리면 vca_adrc.h VCADRC_CUR_WC_HZ 상향, 발진하면 하향.
+     *        L_HENRY 는 placeholder(1.4mH) → 실측 후 VCAdrc_SetPlantParams() 권장.
+     *  ★★ 생산 빌드 복귀: ADRC_CUR_BRINGUP → 0 (또는 USE_ADRC → 0). ★★ */
+#ifndef ADRC_CUR_BRINGUP
+#define ADRC_CUR_BRINGUP   0   /* ★ 0=생산(안전). 1=벤치 전용: 풀돌출 하드스톱에 PUSH 전류 무한 인가 →
+                                *    전류센스(ADC7041)가 PWM 비동기로 레일링(0/65535)이면 ADRC가 풀듀티
+                                *    지령 → 과열/브라운아웃/리부트. 전류센스 PWM 동기화 수정 전엔 켜지 말 것. */
+#endif
+#if USE_ADRC && ADRC_CUR_BRINGUP
+    {
+        const int32_t  bringup_i_lo     = 500;    /* mA: 하단 스텝 (0.5A)            */
+        const int32_t  bringup_i_hi     = 1000;   /* mA: 상단 스텝 (1.0A, "1A부터")  */
+        const uint32_t bringup_dwell_ms = 2000U;  /* 각 레벨 유지 시간               */
+
+        motor_hal_dis_set(MOTOR_HAL_BRIDGE_ENABLE);
+        TLE9201_SetDir(DIR_PUSH);
+        g_motor_active = 1;                       /* PWM 중 위치 ADC 동결            */
+        Loop1_Start(bringup_i_hi, false);         /* USE_ADRC=1 → ISR이 ADRC로 추종  */
+
+        for (;;) {
+            Loop1_SetTarget(bringup_i_hi);
+            osDelay(bringup_dwell_ms);
+            Loop1_SetTarget(bringup_i_lo);
+            osDelay(bringup_dwell_ms);
+        }
+        /* 도달 불가 — 종료는 전원 재인가 또는 ADRC_CUR_BRINGUP=0 재빌드 */
+    }
+#endif
 
     /* ─── 스위치 디바운스 변수 ─── */
     uint8_t raw_now = (HAL_GPIO_ReadPin(HP_SW_GPIO_Port, HP_SW_Pin) == GPIO_PIN_SET) ? 0U : 1U;
@@ -1784,8 +1933,11 @@ void HPSwitchTask_impl(void *argument)
             float depth_user = g_needle_depth_mm;
             if (depth_user < VCA_DEPTH_MM_MIN) depth_user = VCA_DEPTH_MM_MIN;
             if (depth_user > VCA_DEPTH_MM_MAX) depth_user = VCA_DEPTH_MM_MAX;
-            float depth_mm = depth_correction(depth_user);    /* user → motor 내부 */
-            float target_depth_adc = (float)VCA_ADC_HOME + depth_mm * (float)VCA_ADC_PER_MM;
+            /* ② HOLD 목표 = 원하는 실제 깊이(GUI) 직결 (2026-06-24).
+             *  과거: depth_correction(command) 으로 부풀려진 target → 적분기가
+             *  엉뚱한 깊이를 좇아 2.5+ 비단조. 이제 desired actual 기준 → 적분기가
+             *  시드 오차를 원하는 깊이로 곱게 trim (데드밴드 ±0.22mm 내 동결).      */
+            float target_depth_adc = (float)VCA_ADC_HOME + depth_user * (float)VCA_ADC_PER_MM;
 
             /* ── Target trajectory ramp 제거됨 ──
              *  과거 cascaded ramp + KP 체이스 구조는 judder 원인 → 거리 기반
@@ -1831,15 +1983,22 @@ void HPSwitchTask_impl(void *argument)
             } else if (!g_gui_ready) {
                 next_state = OP_STANDBY;  /* depth tracking */
             } else if (in_push) {
-                /* PUSH → HOLD 전환은 시간 기반 (위치/속도 피드백 사용 안함)
-                 *  PUSH 듀티 프로필이 끝나는 시점 (PUSH_TOTAL_MS) 에 HOLD 진입.
-                 *  → position flicker 로 인한 PUSH↔HOLD 토글 차단.                 */
-                #define PUSH_TOTAL_MS  (300U)
+                /* PUSH → HOLD 전환: 위치 임계 우선(depth 제어 복원) + 시간 타임아웃 안전장치.
+                 *  - 침투 burst(PUSH_MIN_DRIVE_MS) 후, pos_f_op 가 목표 depth ADC
+                 *    근처(band) 도달하면 HOLD 진입 → depth 만큼 전진 후 정착.
+                 *  - 또는 PUSH_TIMEOUT_MS 경과(센서 stall/미달 안전장치) → HOLD.
+                 *  단방향 래치(HOLD 진입 시 유지)로 position flicker 토글 차단.        */
+                #define PUSH_MIN_DRIVE_MS  (100U)    /* 침투 burst 보장(이전 위치전환 금지) */
+                #define PUSH_TIMEOUT_MS    (600U)    /* 위치 미도달 시 안전 전환 */
+                #define PUSH_POS_BAND_ADC  (1500.0f) /* 목표 ADC 도달 밴드(≈0.22mm) */
+                uint32_t push_dt = (s_push_t0_op != 0) ? (now - s_push_t0_op) : 0U;
+                bool reached_target = (push_dt >= PUSH_MIN_DRIVE_MS) &&
+                                      (pos_f_op >= (target_depth_adc - PUSH_POS_BAND_ADC));
+                bool push_timeout   = (s_push_t0_op != 0 && push_dt >= PUSH_TIMEOUT_MS);
                 if (s_op_state == OP_READY_HOLD) {
                     next_state = OP_READY_HOLD;
                 } else if (s_op_state == OP_READY_PUSH &&
-                           s_push_t0_op != 0 &&
-                           (now - s_push_t0_op) >= PUSH_TOTAL_MS) {
+                           (reached_target || push_timeout)) {
                     next_state = OP_READY_HOLD;
                 } else {
                     next_state = OP_READY_PUSH;
@@ -1910,9 +2069,10 @@ void HPSwitchTask_impl(void *argument)
                     break;
                 case OP_READY_PUSH:
                     /* PUSH — open-loop 거리 프로필 (KP 체이스 제거)
-                     *  duty 결정은 u_raw 단계에서 dist 기반 (BURST → taper → near)
+                     *  duty 결정은 u_raw 단계에서 시간 기반 (BURST → taper → hold)
                      *  slew/ema 는 약간 빠르게: snap 한 가속 + 평활 균형
-                     *  target_pos_op 은 ff_static_op 정규화 계산용으로만 사용     */
+                     *  target_pos_op = target_depth_adc: reached_target 전환판정
+                     *  과 err_op 텔레메트리용 (연속 P보정엔 미사용)               */
                     target_pos_op = target_depth_adc;
                     kp_op       = 0.0f;        /* 미사용 (u_raw 가 KP 안 씀) */
                     duty_max_op = 1.00f;
@@ -1930,41 +2090,39 @@ void HPSwitchTask_impl(void *argument)
                     break;
             }
 
-            /* ── 정적 FF (작은 base) ──
-             *  target_pos 에 따라 0.05 ~ 0.25 base duty.
-             *  pure-P 는 undershoot 발생 (err=0 시 u=0 → spring 후퇴) →
-             *  적당한 base duty 로 motor 가 항상 약간의 forward force 유지              */
-            #define FF_BASE_HOME  (0.05f)
-            #define FF_BASE_PEAK  (0.25f)
-            float full_range_op = (float)VCA_ADC_MAX_SAFE - (float)VCA_ADC_HOME;
-            float norm_t_op = (target_pos_op - (float)VCA_ADC_HOME) / full_range_op;
-            if (norm_t_op < 0.0f) norm_t_op = 0.0f;
-            if (norm_t_op > 1.0f) norm_t_op = 1.0f;
-            float ff_static_op = FF_BASE_HOME + (FF_BASE_PEAK - FF_BASE_HOME) * norm_t_op;
+            /* ── 정착/HOLD 듀티 = GUI 깊이 직결 시드표 (2026-06-24 재교정) ──
+             *  hold_duty_cal = depth_seed_duty(depth_user): GUI(mm)→평형 듀티 직접표.
+             *  과거 depth_to_duty(depth_correction()) 2겹 합성표는 윗구간 평평
+             *  +3.0/3.5 클램프로 2.5+ 가 안 깊어졌음 → 단조 직결표로 교체.
+             *  · 관통력은 burst(PUSH_DRIVE_DUTY)가 별도 담당 — 깊이 무관 강한 침투.
+             *  · 위치센서는 전환 타이밍(reached_target) + HOLD 적분 trim 에 사용.
+             *  ※ 시드=무부하 평형 근사, 적분기가 target_depth_adc(=desired actual)로 보정. */
+            float hold_duty_cal = depth_seed_duty(depth_user);
 
             /* ── 위치 오차 ── */
             float err_op = target_pos_op - pos_f_op;
             g_vca_err = (int32_t)err_op;
 
-            /* ── u_raw 결정 — 단순 2상태 (PUSH proportional / HOLD pure FF) ──
-             *  PUSH: u_raw = ff_static + KP × err
-             *        모터가 target 지나면 즉시 HOLD 로 전환되므로 추가 분기 불필요.
-             *  HOLD: u_raw = ff_static (피드백 없음 → 진동 절대 불가)
-             *        Spring + FF 평형 위치에서 자연 정착, 위치 변동에 반응 안 함.
+            /* ── u_raw 결정 — PUSH 침투프로필 / HOLD 깊이추종 닫힌루프 ──
+             *  PUSH: u_raw = burst(0.60) → taper → hold_duty_cal (시간 기반).
+             *        모터가 target 지나면 즉시 HOLD 로 전환.
+             *  HOLD: u_raw = 데드밴드 슬로우-적분(아래) → target_depth_adc 수렴.
+             *        (open-loop LUT 은 무부하 포화로 depth 불가 → 닫힌루프로 교체)
              *  IDLE/STANDBY: motor off                                          */
             float u_raw_op;
             if (s_op_state == OP_READY_IDLE || s_op_state == OP_STANDBY) {
                 u_raw_op = 0.0f;
             } else if (s_op_state == OP_READY_PUSH) {
-                /* PUSH — 100% 시간 기반 open-loop 듀티 프로필
-                 *  pos / vel 어떤 피드백도 사용 안함. s_push_t0_op 타이머만 참조.
-                 *  Phase A (0 ~ DRIVE_MS): PUSH_DRIVE_DUTY 로 가속
-                 *  Phase B (DRIVE_MS ~ DRIVE_MS+TAPER_MS): DRIVE → HOLD 듀티
-                 *  Phase C (그 이후): HOLD 듀티 — 곧 HOLD 상태로 인계됨            */
-                #define PUSH_DRIVE_DUTY   (0.40f)
-                #define PUSH_HOLD_DUTY    (0.22f)   /* HOLD 와 동일 값 */
-                #define PUSH_DRIVE_MS     (100U)
+                /* PUSH — 시간 기반 open-loop 침투 프로필 + 깊이별 정착 듀티.
+                 *  Phase A (0~DRIVE_MS): PUSH_DRIVE_DUTY burst (침투, depth 무관).
+                 *  Phase B (~+TAPER_MS): burst → hold_duty_op 로 taper.
+                 *  Phase C (이후): hold_duty_op 유지 — 곧 HOLD 상태로 인계.
+                 *  hold_duty_op = depth_seed_duty(depth_user) 직결표. burst 는 깊이
+                 *  무관 강한 침투, 정착 듀티만 깊이별 → 강관통 + 가변정착 분리.     */
+                #define PUSH_DRIVE_DUTY   (0.60f)   /* 강관통 버스트(0.40→0.60) — 짧게 유지(발열) */
+                #define PUSH_DRIVE_MS     (150U)    /* 버스트 지속(100→150ms) */
                 #define PUSH_TAPER_MS     (200U)
+                float hold_duty_op = hold_duty_cal;
 
                 uint32_t elapsed = (s_push_t0_op != 0) ? (now - s_push_t0_op) : 0;
                 float u_profile;
@@ -1974,16 +2132,37 @@ void HPSwitchTask_impl(void *argument)
                     float t = (float)(elapsed - PUSH_DRIVE_MS)
                             / (float)PUSH_TAPER_MS;
                     u_profile = PUSH_DRIVE_DUTY
-                              + t * (PUSH_HOLD_DUTY - PUSH_DRIVE_DUTY);
+                              + t * (hold_duty_op - PUSH_DRIVE_DUTY);
                 } else {
-                    u_profile = PUSH_HOLD_DUTY;
+                    u_profile = hold_duty_op;
                 }
                 u_raw_op = u_profile;
                 if (u_raw_op > duty_max_op) u_raw_op = duty_max_op;
                 if (u_raw_op < 0.0f) u_raw_op = 0.0f;
             } else {
-                /* HOLD — 모든 피드백 제거. 고정 듀티 (PUSH_HOLD_DUTY 와 동일) */
-                u_raw_op = PUSH_HOLD_DUTY;
+                /* HOLD — 깊이 추종 닫힌루프: 데드밴드 슬로우-적분 (비례게인 없음).
+                 *  open-loop LUT 듀티는 무부하 포화로 늘 mech-stop(~46k) → depth 불가했음.
+                 *  정상 동작하는 위치센서로 target_depth_adc 에 수렴시키되 judder 차단:
+                 *   · |err| ≤ HOLD_DB_ADC : 듀티 동결 → hunting 없음 (핵심)
+                 *   · err>+DB(얕음): 듀티 +STEP / err<-DB(깊음): 듀티 -STEP  (틱=1ms)
+                 *   · clamp [LO,HI]: LO=0(얕은 깊이 도달용), HI=0.40(HOLD 발열 상한)
+                 *  ★튜닝노브: 진동→STEP↓/DB↑, 정착느림→STEP↑, 부하서 깊이부족→HI↑(발열주의) */
+                #define HOLD_DB_ADC   (1500.0f)   /* 데드밴드 ≈0.22mm */
+                #define HOLD_STEP     (0.0005f)   /* 틱(1ms)당 듀티 이동량 */
+                #define HOLD_DUTY_LO  (0.0f)
+                #define HOLD_DUTY_HI  (0.40f)
+                static float s_hold_duty_op = 0.18f;
+                if (push_to_hold) {
+                    s_hold_duty_op = hold_duty_cal;   /* 진입 시 LUT 평형값으로 시드 */
+                }
+                if (err_op > HOLD_DB_ADC) {
+                    s_hold_duty_op += HOLD_STEP;
+                } else if (err_op < -HOLD_DB_ADC) {
+                    s_hold_duty_op -= HOLD_STEP;
+                }
+                if (s_hold_duty_op < HOLD_DUTY_LO) s_hold_duty_op = HOLD_DUTY_LO;
+                if (s_hold_duty_op > HOLD_DUTY_HI) s_hold_duty_op = HOLD_DUTY_HI;
+                u_raw_op = s_hold_duty_op;
                 if (u_raw_op > duty_max_op) u_raw_op = duty_max_op;
                 if (u_raw_op < 0.0f) u_raw_op = 0.0f;
             }
@@ -2534,6 +2713,9 @@ void HPSwitchTask_impl(void *argument)
     TIM8_SetDutyDirect(0.0f);
     osDelay(50);
     VCA_Init();   /* TLE9201 SPI init + enable */
+#if USE_ADRC
+    VCAdrc_Init();   /* ADRC 캐스케이드 초기화 (placeholder gain, 양 루프 disabled) */
+#endif
 
     /* PWM 20kHz 설정 */
     __HAL_TIM_DISABLE(&htim8);
@@ -3079,6 +3261,7 @@ void ADS8325_RS485_Task_impl(void *argument)
 
         /* ADS8325 raw/filtered position output for plotter */
 #if !USE_LINEAR_ACTUATOR
+        g_vca_pos_mm = vca_adc_to_mm(g_vca_pos_adc);   /* 실제 돌출 mm 환산 (Live Expr 확인용) */
         unsigned int raw = (unsigned int)g_vca_pos_raw;
 #else
         unsigned int raw = (unsigned int)g_vca_pos_adc;
@@ -3086,10 +3269,15 @@ void ADS8325_RS485_Task_impl(void *argument)
         unsigned int filtered = (unsigned int)g_vca_pos_adc;
 
         int len = snprintf(g_ads8325_buf, sizeof(g_ads8325_buf),
-                           "$%u %u;\n",
+                           "$%u %u;\n",        /* Serial Port Plotter 프레이밍 ($raw filt;) — 이 프레이밍이 있어야 그래프가 그려짐 (제거하면 blank). Ch0=raw, Ch1=filt */
                            raw,
                            filtered);
-        HAL_UART_Transmit(&huart1, (uint8_t*)g_ads8325_buf, (uint16_t)len, 50);
+        /* 공유 UART1: 최근 명령 입력(RX)이 있었으면 1.5s 간 플로터 묵음 →
+         *  콘솔에 echo/응답이 깨끗이 보이고 blocking TX 끼리의 HAL_BUSY 충돌도 회피.
+         *  스위치를 누르는 동안엔 타이핑을 안 하므로 plot 은 정상 live.            */
+        if ((int32_t)(g_plot_mute_until_ms - HAL_GetTick()) <= 0) {
+            HAL_UART_Transmit(&huart1, (uint8_t*)g_ads8325_buf, (uint16_t)len, 50);
+        }
     }
 }
 

@@ -152,16 +152,30 @@ void ui_event_Slider1(lv_event_t * e)
     }
 
     if(event_code == LV_EVENT_VALUE_CHANGED) {
-        /* Depth 는 3.5mm 잠금 — 사용자가 슬라이더를 건드려도 즉시 6 으로 스냅
-         *  → 표시값 "3.5" 유지, g_needle_depth_mm 변경 없음, STBY 전환 없음 */
-        if (lv_slider_get_value(target) != 6) {
-            lv_slider_set_value(target, 6, LV_ANIM_OFF);
-        }
-        lv_label_set_text(ui_Label1, "3.5");
+        /* Depth: 내부 0-6 → 0.5~3.5mm (step 0.5).  ×10 정수로 표시 */
+        int v = lv_slider_get_value(target) * 5 + 5;   /* 5..35 = 0.5..3.5mm ×10 */
+        { char buf[8]; lv_snprintf(buf, sizeof(buf), "%d.%d", v / 10, v % 10);
+          lv_label_set_text(ui_Label1, buf); }
         slider_label_follow_knob(ui_Label1, target);
 
+        if (s_rs485_syncing) {
+            /* RS485 동기화 중: 라벨만 갱신, STBY 전환/깊이쓰기 안함 */
+            return;
+        }
+
+        /* READY → STBY 자동 전환 (사용자 터치 시에만) — Slider2 와 동일 안전패턴 */
+        extern volatile uint8_t g_gui_ready;
+        if (lv_obj_has_state(ui_ImgButton1, LV_STATE_CHECKED)) {
+            lv_obj_clear_state(ui_ImgButton1, LV_STATE_CHECKED);
+            lv_obj_invalidate(ui_ImgButton1);  /* 강제 갱신 */
+            lv_obj_t * label = lv_obj_get_child(ui_ImgButton1, 0);
+            if(label) lv_label_set_text(label, "STBY");
+        }
+        g_gui_ready = 0U;  /* 슬라이더 변경 시 항상 STBY */
+
+        /* Depth 로컬 상태 업데이트 → OP_ 머신이 다음 PUSH 시 target_depth 로 사용 */
         extern volatile float g_needle_depth_mm;
-        g_needle_depth_mm = 3.5f;  /* 잠금 재확인 */
+        g_needle_depth_mm = (float)v / 10.0f;   /* 0.5 ~ 3.5 */
     }
 
     if(event_code == LV_EVENT_RELEASED) {
@@ -190,7 +204,7 @@ static void ui_rs485_sync_cb(lv_timer_t *timer)
     /* ── 가드 플래그 ON: 슬라이더 이벤트가 STBY로 되돌리지 않도록 ── */
     s_rs485_syncing = 1;
 
-    /* ── 변경된 슬라이더 감지 → 중앙 값 표시 전환 (Depth 잠금: PWR 만 추적) ── */
+    /* ── PWR 변경 감지 시 중앙 값 표시를 Level 로 전환 ── */
     {
         int old_pwr = lv_slider_get_value(ui_Slider2);
         int new_pwr = (int)g_rf_power;
@@ -205,10 +219,17 @@ static void ui_rs485_sync_cb(lv_timer_t *timer)
       lv_label_set_text(ui_Label2, buf); }
     slider_label_follow_knob(ui_Label2, ui_Slider2);
 
-    /* NEEDLE 슬라이더 (Slider1) — 3.5mm 잠금: val=6 / 라벨 "3.5" 고정 */
-    lv_slider_set_value(ui_Slider1, 6, LV_ANIM_OFF);
-    lv_label_set_text(ui_Label1, "3.5");
-    slider_label_follow_knob(ui_Label1, ui_Slider1);
+    /* NEEDLE 슬라이더 (Slider1) — g_needle_depth_mm(0.5~3.5) → 내부 0~6 반영
+     *  (s_rs485_syncing 가드로 위 슬라이더 이벤트는 깊이쓰기 없이 라벨만 갱신) */
+    {
+        int sv = (int)((g_needle_depth_mm * 10.0f - 5.0f) / 5.0f + 0.5f);
+        if (sv < 0) sv = 0; else if (sv > 6) sv = 6;
+        lv_slider_set_value(ui_Slider1, (int32_t)sv, LV_ANIM_OFF);
+        int dv = sv * 5 + 5;
+        char buf[8]; lv_snprintf(buf, sizeof(buf), "%d.%d", dv / 10, dv % 10);
+        lv_label_set_text(ui_Label1, buf);
+        slider_label_follow_knob(ui_Label1, ui_Slider1);
+    }
 
     /* 중앙 상단 값 갱신 */
     update_center_value();
@@ -327,7 +348,7 @@ void ui_Screen1_screen_init(void)
     lv_slider_set_range(ui_Slider2, 0, 9);
     lv_slider_set_value(ui_Slider2, 5, LV_ANIM_OFF);
     if(lv_slider_get_mode(ui_Slider2) == LV_SLIDER_MODE_RANGE) lv_slider_set_left_value(ui_Slider2, 0, LV_ANIM_OFF);
-    lv_obj_set_width(ui_Slider2, 25);
+    lv_obj_set_width(ui_Slider2, 40);   /* 막대 폭 25→40 (잡기 쉽게) */
     lv_obj_set_height(ui_Slider2, 120);
     lv_obj_set_x(ui_Slider2, -77);
     lv_obj_set_y(ui_Slider2, -50);
@@ -364,13 +385,13 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_pad_right(ui_Slider2, 30, LV_PART_KNOB | LV_STATE_DEFAULT);
     lv_obj_set_style_pad_top(ui_Slider2, 18, LV_PART_KNOB | LV_STATE_DEFAULT);
     lv_obj_set_style_pad_bottom(ui_Slider2, 18, LV_PART_KNOB | LV_STATE_DEFAULT);
-    lv_obj_set_ext_click_area(ui_Slider2, 25);  /* 터치 확장 영역 */
+    lv_obj_set_ext_click_area(ui_Slider2, 50);  /* 터치 확장 영역 (25→50: 손가락 hit 쉽게) */
 
     ui_Slider1 = lv_slider_create(ui_Screen1);
     lv_slider_set_range(ui_Slider1, 0, 6);        /* 0.5~3.5mm, step 0.5mm */
-    lv_slider_set_value(ui_Slider1, 6, LV_ANIM_OFF);   /* Depth 3.5mm 고정 (잠금) */
+    lv_slider_set_value(ui_Slider1, 6, LV_ANIM_OFF);   /* Depth 전원투입 기본값 3.5mm (조절 가능) */
     if(lv_slider_get_mode(ui_Slider1) == LV_SLIDER_MODE_RANGE) lv_slider_set_left_value(ui_Slider1, 0, LV_ANIM_OFF);
-    lv_obj_set_width(ui_Slider1, 25);
+    lv_obj_set_width(ui_Slider1, 40);   /* 막대 폭 25→40 (잡기 쉽게) */
     lv_obj_set_height(ui_Slider1, 120);
     lv_obj_set_x(ui_Slider1, 75);
     lv_obj_set_y(ui_Slider1, -50);
@@ -405,7 +426,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_pad_right(ui_Slider1, 30, LV_PART_KNOB | LV_STATE_DEFAULT);
     lv_obj_set_style_pad_top(ui_Slider1, 18, LV_PART_KNOB | LV_STATE_DEFAULT);
     lv_obj_set_style_pad_bottom(ui_Slider1, 18, LV_PART_KNOB | LV_STATE_DEFAULT);
-    lv_obj_set_ext_click_area(ui_Slider1, 25);  /* 터치 확장 영역 */
+    lv_obj_set_ext_click_area(ui_Slider1, 50);  /* 터치 확장 영역 (25→50: 손가락 hit 쉽게) */
 
     /* ── 값 라벨: 슬라이더보다 나중에 생성 → 노브 위에 그려짐 ── */
     ui_Label2 = lv_label_create(ui_Screen1);
