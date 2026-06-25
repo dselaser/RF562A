@@ -1933,11 +1933,25 @@ void HPSwitchTask_impl(void *argument)
             float depth_user = g_needle_depth_mm;
             if (depth_user < VCA_DEPTH_MM_MIN) depth_user = VCA_DEPTH_MM_MIN;
             if (depth_user > VCA_DEPTH_MM_MAX) depth_user = VCA_DEPTH_MM_MAX;
-            /* ② HOLD 목표 = 원하는 실제 깊이(GUI) 직결 (2026-06-24).
-             *  과거: depth_correction(command) 으로 부풀려진 target → 적분기가
-             *  엉뚱한 깊이를 좇아 2.5+ 비단조. 이제 desired actual 기준 → 적분기가
-             *  시드 오차를 원하는 깊이로 곱게 trim (데드밴드 ±0.22mm 내 동결).      */
-            float target_depth_adc = (float)VCA_ADC_HOME + depth_user * (float)VCA_ADC_PER_MM;
+            /* ② HOLD 목표 = 벤치 캘리브레이션 기반 실제 돌출 mm 직결 (2026-06-25).
+             *  과거(06-24): HOME + D×6667. 문제 = 6667 cnt/mm 와 "HOME=0mm 돌출"
+             *  가정이 실측과 어긋나, 같은 GUI 라도 실제론 ~0.9mm 얕게 나옴.
+             *  실측(사용자): GUI 1.0→0.2, 1.5→0.77, 2.0→1.0, 2.5→1.63, 3.0→2.0.
+             *  → 펌웨어 target 의 실제돌출 ≈ D×1.089−0.89 와 정확히 일치(1.0→0.2 정확).
+             *    즉 니들은 target 에 잘 도달, target 자체가 ~0.9mm 얕게 설정돼 있었음.
+             *  벤치 절대캘(2026-06-23): 25000ADC→0.58mm, 40000→3.03mm.
+             *    기울기 6122 cnt/mm, 0mm-돌출 datum ADC≈21449. HOME(=16000) 기준
+             *    평행이동: target = HOME + 5449 + D×6122  (5449 = 21449−16000).
+             *  결과: 목표가 ~0.8mm 깊어짐 = "니들 더 길게" + 깊은 목표라 HOLD 적분
+             *    듀티가 자연히 ↑ = HOLD 힘 ↑(3.5 의 0.40 핀 느낌에 근접). 잔차는
+             *    데드밴드(±0.25mm) + 아래 캘 노브로 미세조정.
+             *  ★캘 노브: DEPTH_CAL_DATUM_ADC(=HOME→0mm돌출 오프셋, 전반 얕/깊),
+             *    DEPTH_CAL_CNT_PER_MM(=기울기, 깊을수록 더/덜). */
+            #define DEPTH_CAL_DATUM_ADC   (5449.0f)   /* HOME 기준 0mm-돌출 오프셋 (21449−16000) */
+            #define DEPTH_CAL_CNT_PER_MM  (6122.0f)   /* 벤치 실측 기울기 (25k~40k 선형구간) */
+            float target_depth_adc = (float)VCA_ADC_HOME
+                                   + DEPTH_CAL_DATUM_ADC
+                                   + depth_user * DEPTH_CAL_CNT_PER_MM;
 
             /* ── Target trajectory ramp 제거됨 ──
              *  과거 cascaded ramp + KP 체이스 구조는 judder 원인 → 거리 기반
@@ -2119,7 +2133,7 @@ void HPSwitchTask_impl(void *argument)
                  *  Phase C (이후): hold_duty_op 유지 — 곧 HOLD 상태로 인계.
                  *  hold_duty_op = depth_seed_duty(depth_user) 직결표. burst 는 깊이
                  *  무관 강한 침투, 정착 듀티만 깊이별 → 강관통 + 가변정착 분리.     */
-                #define PUSH_DRIVE_DUTY   (0.60f)   /* 강관통 버스트(0.40→0.60) — 짧게 유지(발열) */
+                #define PUSH_DRIVE_DUTY   (0.80f)   /* 강관통 버스트(0.60→0.80, 피부관통력↑) — 150ms 단발이라 발열無, 상한1.0 여유 */
                 #define PUSH_DRIVE_MS     (150U)    /* 버스트 지속(100→150ms) */
                 #define PUSH_TAPER_MS     (200U)
                 float hold_duty_op = hold_duty_cal;
@@ -2151,18 +2165,117 @@ void HPSwitchTask_impl(void *argument)
                 #define HOLD_STEP     (0.0005f)   /* 틱(1ms)당 듀티 이동량 */
                 #define HOLD_DUTY_LO  (0.0f)
                 #define HOLD_DUTY_HI  (0.40f)
-                static float s_hold_duty_op = 0.18f;
+                /* ── 정착 → PD 위치서보(active stiffness) (2026-06-25 rev2) ───────
+                 *  [문제] 듀티 동결(constant force)만으론 hold 가 "약하고 출렁"인다:
+                 *   자유 중간위치에서 일정 전류=일정 힘 → 누르면 되밀기 강성 없음
+                 *   (= 스프링 k 뿐) → 약하게 느껴지고, 댐핑 없어 기계공진으로 출렁.
+                 *  [해결] 코드 원설계(주석: "FF+KP*err-KD*vel")대로 PD 서보 복원:
+                 *   · 적분기(deadband)로 우선 target 에 정착 → 그 듀티/위치를 LATCH
+                 *     (baseline 동결 = 깊이 캘리브 유지 + 적분 windup 차단).
+                 *   · 동결 후엔 baseline 위에 KP·(눌린변위) − KD·속도 를 더해
+                 *     - KP(HOLDSV_KP): 누르면 비례해 되민다 → "단단함"(능동 강성).
+                 *     - KD(HOLDSV_KD): 속도 반대로 제동 → 출렁임(공진) 제거.
+                 *   정지 시 변위0·속도0 → baseline 만 → 깊이 안 변함.
+                 *  ★튜닝: 더 단단=HOLDSV_KP↑ / 누를때 버즈·진동=HOLDSV_KD↑(또는 KP↓)
+                 *  ※ 전역 HOLD_KP(line835, 구버전)와 충돌 피하려 HOLDSV_ 접두사 사용. */
+                #define HOLD_LATCH_MS       (250U)
+                #define HOLD_CATCH_MAX_MS   (400U)  /* 관통피크→hold 캐치 안전 타임아웃 */
+                /* ★ rev3 (2026-06-25): rev2 PD 게인이 과대 → 센서/필터 지연과 결합해
+                 *  큰 limit-cycle 진동(±~1mm, 클램프 slam, 누르고 있어도 진동) 발생.
+                 *  안정측에서 재시작: KP 대폭↓, KD=0(지연 미분항이 진동 주범 → 제거),
+                 *  서보 데드밴드 추가(노이즈 미세떨림 차단).
+                 *  [튜닝 절차] 진동 없으면 KP 를 1.3배씩 단계 ↑(8e-6→1e-5→1.3e-5…),
+                 *  진동 시작 직전에서 30% 내려 사용. 빠른 누름서 링잉 보이면 그때만
+                 *  KD 를 1e-6 부터 소량 ↑. (절대 KD 먼저 키우지 말 것 — 지연으로 역효과) */
+                #define HOLDSV_KP           (3.2e-5f)  /* duty/ADC : 0.5mm 눌림당 ≈+0.082 되밀기(rev3 8e-6의 4배, 진동임계 5e-5에 근접 — 진동 시 2.4e-5로 내릴 것) */
+                #define HOLDSV_KD           (0.0f)     /* duty/(ADC/s): 지연 미분=진동위험 → 기본 0 */
+                #define HOLD_SERVO_DB_ADC   (500.0f)   /* 서보 데드밴드 ≈0.08mm: 노이즈로 인한 미세 떨림 차단 */
+                #define HOLD_SERVO_DUTY_HI  (0.50f)    /* 서보 출력 상한(누름저항 bound·발열) */
+                static float    s_hold_duty_op      = 0.18f;
+                static uint8_t  s_holdpos_latched   = 0U;     /* 1=baseline 동결+서보 활성 */
+                static uint32_t s_holdpos_bandt0    = 0U;     /* 인밴드 연속 진입 시각(ms); 0=밴드밖 */
+                static float    s_holdpos_pos_latch = 0.0f;   /* 동결 시점 위치(서보 기준점) */
+                static uint8_t  s_hold_catch        = 0U;     /* 1=관통 피크에서 hold 위치로 잡는 중 */
+                static uint32_t s_hold_catch_t0     = 0U;     /* 캐치 시작 시각(ms) */
                 if (push_to_hold) {
-                    s_hold_duty_op = hold_duty_cal;   /* 진입 시 LUT 평형값으로 시드 */
+                    s_hold_duty_op    = hold_duty_cal;   /* 진입 시 LUT 평형값으로 시드 */
+                    s_holdpos_latched = 0U;              /* 새 누름마다 래치 재무장 */
+                    s_holdpos_bandt0  = 0U;
+                    s_hold_catch      = 1U;              /* 버스트 오버슈트 회복 시작 */
+                    s_hold_catch_t0   = (now != 0U) ? now : 1U;
                 }
-                if (err_op > HOLD_DB_ADC) {
-                    s_hold_duty_op += HOLD_STEP;
-                } else if (err_op < -HOLD_DB_ADC) {
-                    s_hold_duty_op -= HOLD_STEP;
+
+                /* ── 최대 깊이(기구 최대 신장)에서는 백오프 금지 (2026-06-25) ─────
+                 *  니들 기구 최대 신장 ≈3.52mm. 3.5mm 설정에서 target_depth_adc
+                 *  (=HOME+3.5×6667≈39334)는 burst 가 도달하는 실제 mech-stop(~46k)
+                 *  보다 낮다 → 위 닫힌루프가 err<-DB 로 보고 듀티를 깎아 needle 을
+                 *  stop 에서 뒤로 끌어내린다(사용자 관찰: "뒤로 약간 밀린다").
+                 *  최대 깊이에서는 목표추종(back-off)을 끄고, burst(0.60) 직후 전류만
+                 *  줄인 고정 HOLD 듀티로 stop 에 핀 고정 → 위치는 max 유지, 전류만 감소.
+                 *  ★튜닝노브 HOLD_DUTY_MAXPIN: 여전히 뒤로 밀리면 ↑, 너무 세게 물고
+                 *    발열↑이면 ↓ (bench 실측으로 확정). seed(3.5)=0.283·burst=0.60 사이. */
+                #define MAXDEPTH_EPS_MM   (0.05f)
+                #define HOLD_DUTY_MAXPIN  (0.40f)  /* 최대깊이 핀 고정 듀티 (burst 0.60→0.40 으로 전류 감소) */
+                bool at_max_depth = (depth_user >= (VCA_DEPTH_MM_MAX - MAXDEPTH_EPS_MM));
+
+                if (at_max_depth) {
+                    /* 백오프 적분 우회 — stop 에 핀 고정, 전류만 줄여 HOLD 유지 (서보 미적용) */
+                    s_hold_duty_op = HOLD_DUTY_MAXPIN;
+                    u_raw_op = s_hold_duty_op;
+                } else if (!s_holdpos_latched) {
+                    /* ── [관통 피크 → hold 캐치] (2026-06-25) ─────────────────────
+                     *  강버스트가 target 위로 크게 오버슈트(플로터 피크 ~44k)한다.
+                     *  이때 곧바로 슬로우-적분을 돌리면 pos>target 이라 err<-DB →
+                     *  매 틱 듀티를 깎아 평형 아래로 → needle 이 HOME(~12k)까지 추락
+                     *  했다 다시 상승(사용자 관찰: 바닥까지 떨어졌다 홀드로 복귀).
+                     *  대신 회복 동안 듀티를 평형 시드(hold_duty_cal)에 고정 → needle 을
+                     *  target 평형으로 감속 착지시킨다. target 밴드 도달(또는 안전
+                     *  타임아웃)이면 캐치 해제 → 아래 기존 슬로우-적분/래치로 인계. */
+                    if (s_hold_catch) {
+                        if ((pos_f_op <= (target_depth_adc + HOLD_DB_ADC)) ||
+                            ((now - s_hold_catch_t0) >= HOLD_CATCH_MAX_MS)) {
+                            s_hold_catch = 0U;             /* 오버슈트 회복 → 정상 적분 인계 */
+                        } else {
+                            s_hold_duty_op = hold_duty_cal;  /* 평형 듀티 고정(추락 방지) */
+                        }
+                    }
+                    if (!s_hold_catch) {
+                        /* [정착 단계] 데드밴드 슬로우-적분으로 target 수렴. 인밴드 연속
+                         *  HOLD_LATCH_MS 도달 시 baseline 동결 + 그 위치를 서보 기준점으로 기록. */
+                        if (err_op > HOLD_DB_ADC) {
+                            s_hold_duty_op  += HOLD_STEP;
+                            s_holdpos_bandt0 = 0U;              /* 밴드 이탈 → 체류타이머 리셋 */
+                        } else if (err_op < -HOLD_DB_ADC) {
+                            s_hold_duty_op  -= HOLD_STEP;
+                            s_holdpos_bandt0 = 0U;
+                        } else {
+                            if (s_holdpos_bandt0 == 0U) {
+                                s_holdpos_bandt0 = (now != 0U) ? now : 1U;
+                            } else if ((now - s_holdpos_bandt0) >= HOLD_LATCH_MS) {
+                                s_holdpos_latched   = 1U;            /* baseline 동결 */
+                                s_holdpos_pos_latch = pos_f_op;     /* 서보 기준점 = 정착 위치 */
+                            }
+                        }
+                    }
+                    if (s_hold_duty_op < HOLD_DUTY_LO) s_hold_duty_op = HOLD_DUTY_LO;
+                    if (s_hold_duty_op > HOLD_DUTY_HI) s_hold_duty_op = HOLD_DUTY_HI;
+                    u_raw_op = s_hold_duty_op;              /* 정착/캐치 중: baseline 만 */
+                } else {
+                    /* [동결 후] 위치서보 = baseline(동결) + KP·(데드밴드 처리한 눌린변위) − KD·속도.
+                     *  · disp_db>0: 손으로 눌려 들어감 → 비례 되밀기(능동 강성).
+                     *  · 데드밴드: |변위|<DB → 0 처리 → 센서노이즈가 듀티를 흔들지 않음(진동 억제).
+                     *  · −KD·vel : 기본 KD=0(지연 미분 진동 방지). 정지 시 baseline → 깊이 불변. */
+                    float disp_op = s_holdpos_pos_latch - pos_f_op;   /* >0 = 눌려 들어감 */
+                    float disp_db;
+                    if      (disp_op >  HOLD_SERVO_DB_ADC) disp_db = disp_op - HOLD_SERVO_DB_ADC;
+                    else if (disp_op < -HOLD_SERVO_DB_ADC) disp_db = disp_op + HOLD_SERVO_DB_ADC;
+                    else                                   disp_db = 0.0f;
+                    u_raw_op = s_hold_duty_op
+                             + HOLDSV_KP * disp_db
+                             - HOLDSV_KD * s_vel_ema_op;
+                    if (u_raw_op > HOLD_SERVO_DUTY_HI) u_raw_op = HOLD_SERVO_DUTY_HI;
+                    if (u_raw_op < 0.0f)               u_raw_op = 0.0f;
                 }
-                if (s_hold_duty_op < HOLD_DUTY_LO) s_hold_duty_op = HOLD_DUTY_LO;
-                if (s_hold_duty_op > HOLD_DUTY_HI) s_hold_duty_op = HOLD_DUTY_HI;
-                u_raw_op = s_hold_duty_op;
                 if (u_raw_op > duty_max_op) u_raw_op = duty_max_op;
                 if (u_raw_op < 0.0f) u_raw_op = 0.0f;
             }
