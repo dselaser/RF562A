@@ -469,10 +469,14 @@ void ui_Screen1_screen_init(void)
     /* ── 라벨 초기 위치 ── */
     slider_label_follow_knob(ui_Label2, ui_Slider2);   /* PWR: 노브 따라다님 */
 
-    /* Depth 슬라이더는 3.5 고정 (value=6, 노브 중심이 slider top edge 와 일치).
-     *  OUT_TOP_MID + y_ofs=15 : 라벨 중앙이 slider top edge (= 노브 중심) 에
-     *  오도록 절반 높이만큼 아래로 시프트 → 손잡이 정중앙에 표시.            */
-    lv_obj_align_to(ui_Label1, ui_Slider1, LV_ALIGN_OUT_TOP_MID, 0, 15);
+    /* Depth 라벨도 Level(Label2)과 똑같이 follow_knob 로 초기 배치한다.
+     *  [근본원인] lv_obj_align_to() 는 내부에서 라벨 align 을 LV_ALIGN_TOP_LEFT
+     *  로 바꾼다(lv_obj_pos.c:482). 반면 slider_label_follow_knob() 의 knob_y 는
+     *  슬라이더 sy(=-50, CENTER 기준)에서 계산한 '음수' 좌표라 CENTER align
+     *  라벨에서만 맞다. 그래서 드래그 때 follow_knob 가 TOP_LEFT 라벨에
+     *  set_y(음수) 하면 라벨이 화면 위로 날아가 "3.5" 가 사라졌다.
+     *  (Label2 는 계속 CENTER 라 정상) → Level 과 동일하게 통일. */
+    slider_label_follow_knob(ui_Label1, ui_Slider1);
 
     update_center_value();  /* 중앙 값 초기화 */
 
