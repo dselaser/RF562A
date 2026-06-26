@@ -55,6 +55,10 @@ lv_obj_t * ui_LabelPWR = NULL;
 lv_obj_t * ui_LabelNEEDLE = NULL;
 lv_obj_t * ui_LabelCenterValue = NULL;
 
+/* 중앙 값 표시 색 (활성 제어기 값 색과 일치) — update_center_value() 보다 먼저 정의 */
+#define LEVEL_VAL_COL     0x39FF14   /* = ui_Label2 (Level 값 라벨) */
+#define DEPTH_VAL_COL     0xFDD203   /* = ui_Label1 (Depth 값 라벨) */
+
 /* ── 중앙 상단 값 표시 갱신 (활성 슬라이더 기준) ── */
 static void update_center_value(void)
 {
@@ -69,6 +73,162 @@ static void update_center_value(void)
         lv_snprintf(buf, sizeof(buf), "%d.%d", v / 10, v % 10);
     }
     lv_label_set_text(ui_LabelCenterValue, buf);
+    /* 중앙 값 색을 활성 제어기 색과 일치 (Level=초록 / Depth=노랑) */
+    lv_obj_set_style_text_color(ui_LabelCenterValue,
+        lv_color_hex(s_active_slider == 0 ? LEVEL_VAL_COL : DEPTH_VAL_COL),
+        LV_PART_MAIN | LV_STATE_DEFAULT);
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  A안 시험: ▲증가 / ▼감소 삼각형 버튼 (슬라이더 대체)
+ *  - 슬라이더(ui_Slider2=Level, ui_Slider1=Depth)는 숨겨서 '값 저장소'로만 사용.
+ *    (lv_slider_set_value 는 VALUE_CHANGED 이벤트 미발생 — lv_bar.c 확인)
+ *  - ▲/▼ 클릭 시 ±1 단계 변경 → 값 라벨/중앙값/로컬상태(g_*)/STBY 갱신.
+ *  - 버튼은 배경 없이 삼각형만 직접 그리고(lv_draw_triangle), 눌리면 밝은 색.
+ *  - RS485 동기(ui_rs485_sync_cb)는 슬라이더를 그대로 갱신 → 영향 없음.
+ * ═══════════════════════════════════════════════════════════*/
+#define TRI_BIT_DOWN    0x1u   /* dir : 0=▲증가, 1=▼감소 */
+#define TRI_BIT_DEPTH   0x2u   /* side: 0=Level, 1=Depth */
+#define TRI_CODE_LEVEL_UP    (0u)
+#define TRI_CODE_LEVEL_DOWN  (TRI_BIT_DOWN)
+#define TRI_CODE_DEPTH_UP    (TRI_BIT_DEPTH)
+#define TRI_CODE_DEPTH_DOWN  (TRI_BIT_DEPTH | TRI_BIT_DOWN)
+
+/* 삼각형 색 (normal / pressed=밝게) */
+#define TRI_LEVEL_COL     0x00C853
+#define TRI_LEVEL_COL_PR  0x9CFFB0
+#define TRI_DEPTH_COL     0xFFAB00
+#define TRI_DEPTH_COL_PR  0xFFE082
+
+/* 한계값(최대/최소) 도달 삼각형 색 = 적색 (normal / pressed) */
+#define TRI_LIMIT_COL     0xFF2020
+#define TRI_LIMIT_COL_PR  0xFF6060
+
+static lv_obj_t * ui_BtnLevelUp   = NULL;
+static lv_obj_t * ui_BtnLevelDown = NULL;
+static lv_obj_t * ui_BtnDepthUp   = NULL;
+static lv_obj_t * ui_BtnDepthDown = NULL;
+
+/* 삼각형 직접 그리기 (배경 투명 버튼 위). 눌림 상태면 밝은 색. */
+static void tri_draw_cb(lv_event_t * e)
+{
+    lv_obj_t * btn = lv_event_get_target(e);
+    lv_draw_ctx_t * dc = lv_event_get_draw_ctx(e);
+    if(dc == NULL) return;
+    uint32_t code = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    bool is_down  = (code & TRI_BIT_DOWN)  != 0u;
+    bool is_depth = (code & TRI_BIT_DEPTH) != 0u;
+    bool pressed  = (lv_obj_get_state(btn) & LV_STATE_PRESSED) != 0;
+
+    /* 이 버튼이 한계값에 막혔는지: ▲=최대 도달, ▼=최소 도달 */
+    lv_obj_t * slider = is_depth ? ui_Slider1 : ui_Slider2;
+    int sval = lv_slider_get_value(slider);
+    int slim = is_down ? lv_slider_get_min_value(slider)
+                       : lv_slider_get_max_value(slider);
+    bool at_limit = (sval == slim);
+
+    uint32_t rgb;
+    if(at_limit)      rgb = pressed ? TRI_LIMIT_COL_PR : TRI_LIMIT_COL;   /* 한계 → 적색 */
+    else if(is_depth) rgb = pressed ? TRI_DEPTH_COL_PR : TRI_DEPTH_COL;
+    else              rgb = pressed ? TRI_LEVEL_COL_PR : TRI_LEVEL_COL;
+
+    lv_area_t a;
+    lv_obj_get_coords(btn, &a);
+    lv_coord_t pad = 6;   /* 삼각형 1.5배 확대에 맞춰 내부 여백 4→6 (밑변 63·높이 45) */
+    lv_coord_t xl = a.x1 + pad, xr = a.x2 - pad;
+    lv_coord_t yt = a.y1 + pad, yb = a.y2 - pad;
+    lv_coord_t xc = (a.x1 + a.x2) / 2;
+
+    lv_point_t p[3];
+    if(!is_down) {        /* ▲ 위 꼭지점 */
+        p[0].x = xc; p[0].y = yt;
+        p[1].x = xl; p[1].y = yb;
+        p[2].x = xr; p[2].y = yb;
+    } else {              /* ▼ 아래 꼭지점 */
+        p[0].x = xl; p[0].y = yt;
+        p[1].x = xr; p[1].y = yt;
+        p[2].x = xc; p[2].y = yb;
+    }
+
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.bg_color = lv_color_hex(rgb);
+    dsc.bg_opa   = LV_OPA_COVER;
+    lv_draw_triangle(dc, &dsc, p);
+}
+
+/* 눌림/뗌 시 삼각형 다시 그리도록 무효화 (색 변화 보장) */
+static void tri_press_cb(lv_event_t * e)
+{
+    lv_obj_invalidate(lv_event_get_target(e));
+}
+
+/* 클릭 시 값 ±1 단계 변경 */
+static void tri_click_cb(lv_event_t * e)
+{
+    uint32_t code = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    bool is_down  = (code & TRI_BIT_DOWN)  != 0u;
+    bool is_depth = (code & TRI_BIT_DEPTH) != 0u;
+    int dir = is_down ? -1 : +1;
+
+    lv_obj_t * slider = is_depth ? ui_Slider1 : ui_Slider2;
+    int mn  = lv_slider_get_min_value(slider);
+    int mx  = lv_slider_get_max_value(slider);
+    int cur = lv_slider_get_value(slider);
+    int nv  = cur + dir;
+    if(nv < mn) nv = mn; else if(nv > mx) nv = mx;
+    if(nv == cur) return;   /* 한계값 — 변화 없음 */
+
+    lv_slider_set_value(slider, nv, LV_ANIM_OFF);  /* 이벤트 미발생 (값 저장소) */
+
+    extern volatile uint8_t g_gui_ready;
+    if(!is_depth) {
+        s_active_slider = 0;
+        char buf[8]; lv_snprintf(buf, sizeof(buf), "%d", nv + 1);
+        lv_label_set_text(ui_Label2, buf);
+        g_rf_power = (uint8_t)nv;
+    } else {
+        s_active_slider = 1;
+        int v = nv * 5 + 5;
+        char buf[8]; lv_snprintf(buf, sizeof(buf), "%d.%d", v / 10, v % 10);
+        lv_label_set_text(ui_Label1, buf);
+        extern volatile float g_needle_depth_mm;
+        g_needle_depth_mm = (float)v / 10.0f;
+    }
+    update_center_value();
+
+    /* 한계값 적색 표시 갱신: 같은 열의 ▲▼ 둘 다 다시 그림
+     * (값이 바뀌면 반대편 삼각형의 한계 상태도 변할 수 있으므로) */
+    if(is_depth) { lv_obj_invalidate(ui_BtnDepthUp); lv_obj_invalidate(ui_BtnDepthDown); }
+    else         { lv_obj_invalidate(ui_BtnLevelUp); lv_obj_invalidate(ui_BtnLevelDown); }
+
+    /* 슬라이더 핸들러와 동일한 READY→STBY 안전 전환 */
+    if(lv_obj_has_state(ui_ImgButton1, LV_STATE_CHECKED)) {
+        lv_obj_clear_state(ui_ImgButton1, LV_STATE_CHECKED);
+        lv_obj_invalidate(ui_ImgButton1);
+        lv_obj_t * lbl = lv_obj_get_child(ui_ImgButton1, 0);
+        if(lbl) lv_label_set_text(lbl, "STBY");
+    }
+    g_gui_ready = 0U;
+}
+
+/* 삼각형 버튼 생성 헬퍼 (배경 없음, 삼각형만 보임) */
+static lv_obj_t * make_tri_btn(lv_obj_t * parent, lv_coord_t x, lv_coord_t y, uint32_t code)
+{
+    lv_obj_t * b = lv_btn_create(parent);
+    lv_obj_remove_style_all(b);            /* 배경/테두리/그림자 제거 → 삼각형만 */
+    lv_obj_set_size(b, 75, 57);            /* 삼각형 1.5배 확대 (50×38 → 75×57) */
+    lv_obj_set_x(b, x);
+    lv_obj_set_y(b, y);
+    lv_obj_set_align(b, LV_ALIGN_CENTER);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(b, 4);       /* 버튼 확대로 ext 14→4 (가운데 ~15px 데드존 유지, 클릭영역 겹침 방지) */
+    lv_obj_add_event_cb(b, tri_draw_cb,  LV_EVENT_DRAW_MAIN_END, (void *)(uintptr_t)code);
+    lv_obj_add_event_cb(b, tri_click_cb, LV_EVENT_CLICKED,       (void *)(uintptr_t)code);
+    lv_obj_add_event_cb(b, tri_press_cb, LV_EVENT_PRESSED,       NULL);
+    lv_obj_add_event_cb(b, tri_press_cb, LV_EVENT_RELEASED,      NULL);
+    return b;
 }
 
 // event funtions
@@ -217,7 +377,6 @@ static void ui_rs485_sync_cb(lv_timer_t *timer)
     lv_slider_set_value(ui_Slider2, (int32_t)g_rf_power, LV_ANIM_OFF);
     { char buf[8]; lv_snprintf(buf, sizeof(buf), "%d", (int)g_rf_power + 1);
       lv_label_set_text(ui_Label2, buf); }
-    slider_label_follow_knob(ui_Label2, ui_Slider2);
 
     /* NEEDLE 슬라이더 (Slider1) — g_needle_depth_mm(0.5~3.5) → 내부 0~6 반영
      *  (s_rs485_syncing 가드로 위 슬라이더 이벤트는 깊이쓰기 없이 라벨만 갱신) */
@@ -228,11 +387,14 @@ static void ui_rs485_sync_cb(lv_timer_t *timer)
         int dv = sv * 5 + 5;
         char buf[8]; lv_snprintf(buf, sizeof(buf), "%d.%d", dv / 10, dv % 10);
         lv_label_set_text(ui_Label1, buf);
-        slider_label_follow_knob(ui_Label1, ui_Slider1);
     }
 
     /* 중앙 상단 값 갱신 */
     update_center_value();
+
+    /* 외부(RS485) 값 변경 → 한계값 적색 표시 갱신 (4개 삼각형 모두) */
+    lv_obj_invalidate(ui_BtnLevelUp);  lv_obj_invalidate(ui_BtnLevelDown);
+    lv_obj_invalidate(ui_BtnDepthUp);  lv_obj_invalidate(ui_BtnDepthDown);
 
     /* ── READY/STBY 버튼 (마지막에 설정 — 슬라이더가 덮어쓰지 못함) ── */
     {
@@ -325,7 +487,7 @@ void ui_Screen1_screen_init(void)
     ui_LabelPWR = lv_label_create(ui_Screen1);
     lv_obj_set_width(ui_LabelPWR, LV_SIZE_CONTENT);
     lv_obj_set_height(ui_LabelPWR, LV_SIZE_CONTENT);
-    lv_obj_set_x(ui_LabelPWR, -77);
+    lv_obj_set_x(ui_LabelPWR, -69);   /* 1mm(8px) 중앙으로 */
     lv_obj_set_y(ui_LabelPWR, 35);
     lv_obj_set_align(ui_LabelPWR, LV_ALIGN_CENTER);
     lv_label_set_text(ui_LabelPWR, "Level");
@@ -336,7 +498,7 @@ void ui_Screen1_screen_init(void)
     ui_LabelNEEDLE = lv_label_create(ui_Screen1);
     lv_obj_set_width(ui_LabelNEEDLE, LV_SIZE_CONTENT);
     lv_obj_set_height(ui_LabelNEEDLE, LV_SIZE_CONTENT);
-    lv_obj_set_x(ui_LabelNEEDLE, 75);
+    lv_obj_set_x(ui_LabelNEEDLE, 67);   /* 1mm(8px) 중앙으로 */
     lv_obj_set_y(ui_LabelNEEDLE, 35);
     lv_obj_set_align(ui_LabelNEEDLE, LV_ALIGN_CENTER);
     lv_label_set_text(ui_LabelNEEDLE, "Depth");
@@ -428,24 +590,30 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_pad_bottom(ui_Slider1, 18, LV_PART_KNOB | LV_STATE_DEFAULT);
     lv_obj_set_ext_click_area(ui_Slider1, 50);  /* 터치 확장 영역 (25→50: 손가락 hit 쉽게) */
 
-    /* ── 값 라벨: 슬라이더보다 나중에 생성 → 노브 위에 그려짐 ── */
+    /* ── A안: 슬라이더는 숨겨서 '값 저장소'로만 사용 (▲/▼ 버튼이 값을 조절) ── */
+    lv_obj_add_flag(ui_Slider2, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ui_Slider1, LV_OBJ_FLAG_HIDDEN);
+
+    /* ── 값 라벨: 삼각형 사이 고정 위치에 표시 ── */
     ui_Label2 = lv_label_create(ui_Screen1);
     lv_obj_set_width(ui_Label2, LV_SIZE_CONTENT);
     lv_obj_set_height(ui_Label2, LV_SIZE_CONTENT);
-    lv_obj_set_x(ui_Label2, -77);
+    lv_obj_set_x(ui_Label2, -69);   /* 1mm(8px) 중앙으로 (Level 열) */
+    lv_obj_set_y(ui_Label2, -50);   /* A안: 삼각형 사이 고정 위치 */
     lv_obj_set_align(ui_Label2, LV_ALIGN_CENTER);
     lv_label_set_text(ui_Label2, "6");
-    lv_obj_set_style_text_color(ui_Label2, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(ui_Label2, lv_color_hex(0x39FF14), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_Label2, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(ui_Label2, &ui_font_H1, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Label1 = lv_label_create(ui_Screen1);
     lv_obj_set_width(ui_Label1, LV_SIZE_CONTENT);
     lv_obj_set_height(ui_Label1, LV_SIZE_CONTENT);
-    lv_obj_set_x(ui_Label1, 75);
+    lv_obj_set_x(ui_Label1, 67);   /* 1mm(8px) 중앙으로 (Depth 열) */
+    lv_obj_set_y(ui_Label1, -50);   /* A안: 삼각형 사이 고정 위치 */
     lv_obj_set_align(ui_Label1, LV_ALIGN_CENTER);
     lv_label_set_text(ui_Label1, "3.5");  /* Depth 잠금 표시 */
-    lv_obj_set_style_text_color(ui_Label1, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(ui_Label1, lv_color_hex(0xFDD203), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_Label1, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(ui_Label1, &ui_font_H1, LV_PART_MAIN | LV_STATE_DEFAULT);
 
@@ -460,24 +628,20 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_LabelCenterValue, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(ui_LabelCenterValue, &ui_font_H1, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    /* ── A안 시험: Level(왼쪽) / Depth(오른쪽) ▲증가·▼감소 삼각형 버튼 ── */
+    /* 좌(Level) x=-69, 우(Depth) x=67 ; ▲ y -90→-98(위로 8px), ▼ y -10→-2(아래로 8px) */
+    ui_BtnLevelUp   = make_tri_btn(ui_Screen1, -69, -98, TRI_CODE_LEVEL_UP);
+    ui_BtnLevelDown = make_tri_btn(ui_Screen1, -69,  -2, TRI_CODE_LEVEL_DOWN);
+    ui_BtnDepthUp   = make_tri_btn(ui_Screen1,  67, -98, TRI_CODE_DEPTH_UP);
+    ui_BtnDepthDown = make_tri_btn(ui_Screen1,  67,  -2, TRI_CODE_DEPTH_DOWN);
+
     lv_obj_add_event_cb(ui_ImgButton1, ui_event_ImgButton1, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_Slider2, ui_event_Slider2, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_Slider1, ui_event_Slider1, LV_EVENT_ALL, NULL);
     /* Screen1 이벤트 제거 — 배경색 변경 방지 */
     uic_ImgButton1 = ui_ImgButton1;
 
-    /* ── 라벨 초기 위치 ── */
-    slider_label_follow_knob(ui_Label2, ui_Slider2);   /* PWR: 노브 따라다님 */
-
-    /* Depth 라벨도 Level(Label2)과 똑같이 follow_knob 로 초기 배치한다.
-     *  [근본원인] lv_obj_align_to() 는 내부에서 라벨 align 을 LV_ALIGN_TOP_LEFT
-     *  로 바꾼다(lv_obj_pos.c:482). 반면 slider_label_follow_knob() 의 knob_y 는
-     *  슬라이더 sy(=-50, CENTER 기준)에서 계산한 '음수' 좌표라 CENTER align
-     *  라벨에서만 맞다. 그래서 드래그 때 follow_knob 가 TOP_LEFT 라벨에
-     *  set_y(음수) 하면 라벨이 화면 위로 날아가 "3.5" 가 사라졌다.
-     *  (Label2 는 계속 CENTER 라 정상) → Level 과 동일하게 통일. */
-    slider_label_follow_knob(ui_Label1, ui_Slider1);
-
+    /* ── A안: 값 라벨은 삼각형 사이 고정 위치 → follow_knob 미사용 ── */
     update_center_value();  /* 중앙 값 초기화 */
 
     /* RS485 수신 → UI 동기화 타이머 (20ms 주기, LVGL 스레드에서 실행) */
@@ -499,5 +663,9 @@ void ui_Screen1_screen_destroy(void)
     ui_LabelPWR = NULL;
     ui_LabelNEEDLE = NULL;
     ui_LabelCenterValue = NULL;
+    ui_BtnLevelUp = NULL;
+    ui_BtnLevelDown = NULL;
+    ui_BtnDepthUp = NULL;
+    ui_BtnDepthDown = NULL;
 
 }
