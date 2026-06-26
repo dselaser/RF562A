@@ -875,19 +875,40 @@ static float depth_to_duty(float depth_mm)
 }
 
 /* ══ 직접 깊이 시드: GUI 깊이(mm) → HOLD 평형 듀티 ════════════════════════
- *  2026-06-24 재교정. depth_correction(GUI→command)+depth_to_duty(command→duty)
- *  2겹 합성표를 1겹 직결표로 대체. 합성표 문제:
- *    ① 윗구간 평평(GUI 2.0→0.220, 2.5→0.229: 데드밴드보다 작은 차 → 같은 깊이)
- *    ② GUI 3.0/3.5 가 command 3.50 으로 클램프 → 같은 듀티(구분 불가)
- *  하단(0.5~2.0)은 기존 합성값 그대로(0.190/0.194/0.204/0.220) → 잘 맞던 교정 보존.
- *  상단(2.5/3.0/3.5)만 실측 기울기(≈+0.042 duty/mm)로 가파르게 + 각 단계 구분.
- *  ★재교정 노브: 이 표 duty 만 수정. 얕으면↑/깊으면↓ (발열 상한 ≤0.40 권장). */
+ *  강한 리턴스프링 open-loop 전 깊이 공통 HOLD 듀티 (강스프링이 부하 제공 →
+ *  듀티↔돌출 단조·예측가능, 무부하 포화 없음). 2026-06-26 벤치 반복교정:
+ *   ·1차 선형핏 {0.259..0.541}: 1.0→0.45 … 3.5→3.94mm (얕음 미달·깊음 과돌출).
+ *   ·2차 {0.309..0.500}: 1.0→1.19 1.5→1.58 2.0→2.18 2.5→2.57 3.0→2.86 3.5→3.44
+ *     (얕은쪽 과돌출로 반전, 깊은쪽 양호).
+ *   ·3차: 설정별 2-pass(듀티→mm) 역보간. 0.5:0.282 1.0:0.333 1.5:0.373 2.0:0.408
+ *     2.5:0.449 3.0:0.479 3.5:0.505 (구 핸드피스 기준).
+ *   ·4차(2026-06-26 — 다른 핸드피스): 3차 LUT 로 이 개체 실측 →
+ *     1.0:0.93 2.0:1.75 3.0:2.41 3.5:2.65mm (깊을수록 크게 미달). 듀티→mm 선형
+ *     (L≈9.96·duty−2.361) 역산 → 0.287/0.337/0.388/0.438/0.488/0.538/0.588.
+ *   ·5차(2026-06-26): 4차 듀티 +0.006~0.029 ↑. 실측 1.0:1.25 2.0:2.47 3.0:3.50
+ *     3.5:3.58 (전구간 과돌출!). ※핵심: 1.0 은 듀티 무변(0.337)인데도 1.12→1.25
+ *     (+0.13) → 세션간 ±0.3~0.5mm 드리프트(stiction) 실재. 또 3.0(0.567)·
+ *     3.5(0.611) 둘다 ~3.5mm = 상단 포화(기구한계 ~3.9 근처, 0.567 위는 듀티
+ *     늘려도 거의 안 늘어남 → 0.611 은 발열만 낭비).
+ *   ·6차(2026-06-26, case-OPEN): 4·5차 평균 센터링 →
+ *     0.278/0.320/0.366/0.415/0.462/0.525/0.600.
+ *   ·★7차(현재, 2026-06-26, ★case-CLOSED): 6차 LUT 를 케이스 닫고(=실사용 조건)
+ *     실측 1.0:0.31 2.0:1.31 3.0:2.26 3.5:3.03 — 전구간 ~0.7mm 균일 미달!
+ *     ⇒ 1~6차 "산포"의 상당부분은 케이스 개폐 상태차였음(닫으면 프리로드/마찰↑
+ *     로 돌출↓). case-CLOSED 데이터는 선형핏 깨끗(L≈9.58·duty−2.727, 잔차<0.06,
+ *     포화 없음) → 역산: 0.337/0.389/0.441/0.493/0.546/0.598/0.650.
+ *     ※평가/사용은 항상 케이스 닫고. 이후 교정·측정도 반드시 case-CLOSED 로!
+ *  ★재교정 노브: 각 깊이 실측(★case-CLOSED) 후 이 표 duty 만 수정. 얕으면↑/깊으면↓.
+ *  ※발열 ∝듀티²(3.5=0.650→권고 0.40 대비 ≈2.6×·3.0=0.598→2.2×, 깊은쪽 연속
+ *    HOLD 코일온도 주의 — 이 발열은 케이스 프리로드 버티는 힘이라 닫힌루프로도
+ *    안 줄어듦). 더 정밀·반복성 필요 시 닫힌루프(센서)로 — target_depth_adc
+ *    (:1952, 옛 6122 cnt/mm) 재캘 필요. 측정은 케이스/온도/순서 일정하게. */
 #define SEED_LUT_N  7
 static const float seed_lut_gui[SEED_LUT_N]  = {
     0.50f, 1.00f, 1.50f, 2.00f, 2.50f, 3.00f, 3.50f
 };
 static const float seed_lut_duty[SEED_LUT_N] = {
-    0.190f, 0.194f, 0.204f, 0.220f, 0.241f, 0.262f, 0.283f
+    0.337f, 0.389f, 0.441f, 0.493f, 0.546f, 0.598f, 0.650f   /* ★7th cal (case-CLOSED) — CURRENT */
 };
 static float depth_seed_duty(float gui_mm)
 {
@@ -1829,24 +1850,40 @@ void HPSwitchTask_impl(void *argument)
          *  RS485 g_vca_state 매핑: STANDBY=0, IDLE=4, PUSH=1, HOLD=2
          * ═══════════════════════════════════════════════════════════════ */
         {
-            /* ── RETURN-with-BRAKE 파라미터 (HOLD/PUSH→IDLE 시, 홈 충돌음 제거) ──
-             *  전략: 제어 루프 없이 상수 FF_HOME duty 만 인가 (진동 원천 차단)
-             *        - duty = VCA_SINE_FF_HOME_DUTY (≈0.11) = 홈 위치 정적 평형 듀티
-             *        - 평형점 = 홈 → 니들이 자연스럽게 홈 평형으로 수렴하며 감속
-             *        - 깊은 위치: 스프링(0.26)>모터(0.11) → 홈 방향 가속
-             *        - 홈 도착: 모터=스프링 평형 → 잔여 운동에너지 자연 소산
-             *        - PWM 11% 의 LOW 구간(89%)은 low-side brake → 감쇠 추가 효과
-             *        - 듀티가 절대 변동 안 함 → 진동/발진 원인 자체 없음
-             *  단위: 위치=ADC(VCA_ADC_HOME=3300, /mm=10200)
+            /* ── RETURN 소프트랜딩 파라미터 (HOLD/PUSH→IDLE 시, 홈 충돌음 제거) ──
+             *  ★2026-06-26 v5 — 위치 피드포워드 "스프링-평형" 역전류 (개루프, 발진 원천 제거).
+             *  [원래 있던 기능의 복원·일반화] 과거엔 "상수 FF_HOME(≈0.11) 만 인가" 하는
+             *  개루프 방식이었다(이 주석이 그 흔적). 하지만 단일 상수는 "홈"에서만 스프링과
+             *  평형 — 돌출이 크면 스프링이 5배 강해 0.11 로는 못 버티고 가속·슬램한다.
+             *  그래서 누군가 속도피드백 제동(v2~v4)을 붙였고, 그게 0↔상한 뱅뱅으로 스프링을
+             *  거꾸로 이겨 니들을 바깥으로 되튕겨 한계진동(파형 버징)을 만들었다.
+             *  근본 해결: 스프링 힘은 "위치"의 함수(= HOLD 평형듀티 곡선)이므로, 그 평형듀티를
+             *  위치로 스케줄해 DIR_PUSH 로 인가하면 복귀 내내 모터가 스프링과 거의 평형.
+             *  거기서 BIAS 만큼만 덜 줘서 약한 안쪽 net 힘 → 전 구간 등속 저속하강 → 소프트랜딩.
+             *    ff(pos) = FF_HOME + FF_SLOPE×(pos−HOME)      // 위치별 스프링-평형 역전류
+             *    brake   = clamp(ff − DESCENT_BIAS, 0, CEIL)  // BIAS 만큼만 안쪽 = 약한 등속하강
+             *  ▸ 속도피드백이 전혀 없음 → 피드백 한계진동 원리적으로 불가(v2~v4 와 결정적 차이).
+             *  ▸ 보이스코일 back-EMF + PWM-off low-side 제동이 "빠를수록 더 제동" 자연감쇠 →
+             *    개루프인데도 종속(terminal)속도로 수렴, 폭주 없음.
+             *  ▸ FF_* 는 HOLD seed LUT(0.5mm→0.282 … 3.5mm→0.505) 를 ADC 위치축으로 환산한 값:
+             *    기울기 (0.505−0.282)/(42876−24510)≈1.21e-5/ADC, HOME 외삽 절편≈0.18.
+             *  ★튜닝(증상→조치):
+             *    · 아직 쾅 / 너무 빠름   → DESCENT_BIAS↓ (평형에 더 근접 = 더 느림·조용)
+             *    · 복귀 안 끝남/너무 느림 → DESCENT_BIAS↑ (정마찰로 공중정지 시 ↑ 필수)
+             *    · 상단(돌출 큰 곳)에서 쾅 → FF_SLOPE↑   (강해진 스프링 더 상쇄)
+             *    · 홈 근처에서 쾅        → FF_HOME↑
+             *    · 어디선가 바깥으로 튕겨 안 내려옴 → DESCENT_BIAS↑ 또는 FF_* 소폭↓
+             *  단위: 위치=ADC(VCA_ADC_HOME≈16000 런타임, ≈6667 cnt/mm)
              *  ─────────────────────────────────────────────────────────── */
-            #define RETURN_PULL_DUTY            (0.18f)   /* 즉각 PULL duty — 스위치 OFF 시 능동 retract */
-            #define RETURN_PULL_END_BAND_ADC    (5000)    /* PULL 종료 판정 (≈0.5mm) — BRAKE 단계 진입 */
-            #define RETURN_PULL_TIMEOUT_MS      (400U)    /* PULL 단계 안전 타임아웃 */
-            #define RETURN_BRAKE_DUTY           (0.0f)    /* BRAKE: PWM=0 → 저측 브레이크 (back-EMF 감쇠), 능동 PUSH 없음 — 강한 스프링이 자체 감속 */
-            #define RETURN_HOME_BAND_ADC        (1500)    /* BRAKE 종료 판정 (≈0.15mm) — SEAT 단계 진입 */
-            #define RETURN_BRAKE_TIMEOUT_MS_OP  (300U)    /* BRAKE 단계 안전 타임아웃 (PULL 후 짧게) */
-            #define RETURN_SEAT_DUTY            (0.07f)   /* 안착 PULL duty — 정마찰 극복용 약한 힘 */
-            #define RETURN_SEAT_MS              (200U)    /* 안착 단계 지속시간 — 슬램 없이 home 밀착 */
+            #define RETURN_FF_DUTY_HOME     (0.18f)     /* home 에서의 스프링-평형 역전류(DIR_PUSH). LUT 최저단 외삽≈0.18 */
+            #define RETURN_FF_DUTY_SLOPE    (1.21e-5f)  /* 돌출 1 ADC 당 추가 평형 역전류. (0.505−0.282)/(42876−24510) */
+            #define RETURN_FF_DESCENT_BIAS  (0.060f)    /* 평형에서 덜 주는 양 = 약한 안쪽 net 힘(하강속도 결정). ↓=더 조용/느림.
+                                                          *  ※ 너무 낮추면 정마찰로 공중정지→타임아웃→SEAT 슬램 위험. 0.06 부터 시작해 ↓ 튜닝. */
+            #define RETURN_FF_DUTY_CEIL     (0.75f)     /* 역전류 상한(안전). 평형을 크게 못 넘게 = 바깥 되튕김 방지 */
+            #define RETURN_SEAT_BAND_ADC    (1500)      /* 하강→SEAT 전환 (home+1500 ≈ 0.22mm) */
+            #define RETURN_DESCENT_TIMEOUT_MS (1200U)   /* 하강 안전 타임아웃 → SEAT (정상 하강은 그 전 완료) */
+            #define RETURN_SEAT_DUTY        (0.07f)     /* 안착 PULL duty — 정마찰 극복용 약한 힘 */
+            #define RETURN_SEAT_MS          (200U)      /* 안착 단계 지속시간 — 슬램 없이 home 밀착 */
 
             enum { OP_STANDBY = 0, OP_READY_IDLE, OP_READY_PUSH, OP_READY_HOLD };
             static uint8_t s_op_state    = OP_STANDBY;
@@ -1856,14 +1893,13 @@ void HPSwitchTask_impl(void *argument)
             static float   s_pos_ema_op  = 0.0f;
             static bool    s_pos_init_op = false;
 
-            /* RETURN 단계 상태:
-             *   1 = PULL_FAST (DIR_PULL 0.18 — 즉각 능동 retract, 빠른 home 접근)
-             *   2 = BRAKE     (DIR_PUSH 0.13 — home 직전 감속, 슬램 방지)
-             *   3 = SEAT      (DIR_PULL 0.07 — home 정마찰 극복, 완전 밀착)
-             *   0 = OFF       (안착 완료, 모터 완전 OFF)                          */
+            /* RETURN 단계 상태 (v5 — Phase 2 BRAKE 제거, PULL→피드포워드 DESCENT 로 대체):
+             *   1 = DESCENT (DIR_PUSH 위치-스케줄 평형 역전류 − BIAS — 전 구간 등속 저속하강)
+             *   3 = SEAT    (DIR_PULL 0.07 — home 정마찰 극복, 완전 밀착)
+             *   0 = OFF     (안착 완료, 모터 완전 OFF)
+             *  ※ 값 2 는 더 이상 set 되지 않음(1→3 직접 전환).                   */
             static uint8_t  s_ret_brake_active = 0;
-            static uint32_t s_ret_pull_t0      = 0;
-            static uint32_t s_ret_brake_t0     = 0;
+            static uint32_t s_ret_pull_t0      = 0;   /* DESCENT 시작 시각(타임아웃용) */
             static uint32_t s_ret_seat_t0      = 0;
 
             /* PUSH BURST 상태 — to_push 시각 기록, 시간 기반 burst 종료 */
@@ -2133,7 +2169,8 @@ void HPSwitchTask_impl(void *argument)
                  *  Phase C (이후): hold_duty_op 유지 — 곧 HOLD 상태로 인계.
                  *  hold_duty_op = depth_seed_duty(depth_user) 직결표. burst 는 깊이
                  *  무관 강한 침투, 정착 듀티만 깊이별 → 강관통 + 가변정착 분리.     */
-                #define PUSH_DRIVE_DUTY   (0.80f)   /* 강관통 버스트(0.60→0.80, 피부관통력↑) — 150ms 단발이라 발열無, 상한1.0 여유 */
+                #define PUSH_DRIVE_DUTY   (1.00f)   /* 강관통 버스트 — 150ms 단발이라 발열無, 상한1.0(HW ~9.5V).
+                                                   *  2026-06-26: 강한 리턴스프링이 관통력 깎음 → 0.80→1.00(HW 최대 침투력). */
                 #define PUSH_DRIVE_MS     (150U)    /* 버스트 지속(100→150ms) */
                 #define PUSH_TAPER_MS     (200U)
                 float hold_duty_op = hold_duty_cal;
@@ -2215,12 +2252,28 @@ void HPSwitchTask_impl(void *argument)
                  *  ★튜닝노브 HOLD_DUTY_MAXPIN: 여전히 뒤로 밀리면 ↑, 너무 세게 물고
                  *    발열↑이면 ↓ (bench 실측으로 확정). seed(3.5)=0.283·burst=0.60 사이. */
                 #define MAXDEPTH_EPS_MM   (0.05f)
-                #define HOLD_DUTY_MAXPIN  (0.40f)  /* 최대깊이 핀 고정 듀티 (burst 0.60→0.40 으로 전류 감소) */
+                #define HOLD_DUTY_MAXPIN  (0.54f)  /* ★2026-06-26 미사용: 전 깊이 depth_seed_duty 로 통일(3.5→0.541 이 대체).
+                                                   *  최대깊이 핀 고정 듀티 (강한 리턴스프링 대응, open-loop).
+                                                   *  2026-06-26 실측(3.5 설정 hold 돌출, burst 1.0):
+                                                   *    0.40→2.0mm, 0.48→2.83mm, 0.58→3.9mm(기구한계 핀, 오버슈트).
+                                                   *  기울기 ≈10.7mm/듀티 → 3.5mm ≈ 0.543 → 0.58에서 0.54 로 하향.
+                                                   *  ★안전: 물리>설정(깊은쪽)이 위험방향 → 살짝 언더슈트 선호.
+                                                   *  ★발열: 0.54 는 작성자 권고천장 0.40(line884) 대비 ≈1.8×(∝듀티²)
+                                                   *    → 연속 HOLD 코일온도 실측. ※듀티↔깊이 기울기 가팔라(0.1듀티≈1mm)
+                                                   *    open-loop 는 개체·온도 편차에 취약 → 닫힌루프+센서재캘리 검토. */
                 bool at_max_depth = (depth_user >= (VCA_DEPTH_MM_MAX - MAXDEPTH_EPS_MM));
+                (void)at_max_depth;   /* 2026-06-26: 전 깊이 open-loop 통일로 분기 불요 */
 
-                if (at_max_depth) {
-                    /* 백오프 적분 우회 — stop 에 핀 고정, 전류만 줄여 HOLD 유지 (서보 미적용) */
-                    s_hold_duty_op = HOLD_DUTY_MAXPIN;
+                /* ── 전 깊이 open-loop 고정 듀티 (2026-06-26, 강한 리턴스프링) ───────
+                 *  HOLD 듀티 = hold_duty_cal = depth_seed_duty(강스프링 법칙, :889-891).
+                 *  PUSH taper 종단(:2140)과 동일값 → PUSH→HOLD 핸드오프 연속(딥 없음).
+                 *  과거 닫힌루프(시드0.19~/HI=0.40/느린적분/래치)는 강스프링서 needle 이
+                 *  ~1mm 평형으로 붕괴 → depth 1/2/3 불규칙(실측). 아래 분기 보존하되 비활성.
+                 *  ※max(3.5)도 depth_seed_duty(3.5)=0.541 ≈ 기존 MAXPIN 0.54 → 동일 hold.
+                 *  ※되돌리려면 HOLD_OPENLOOP_ALL 0 → 옛 닫힌루프 복귀(단 강스프링 재튜닝 필요). */
+                #define HOLD_OPENLOOP_ALL  (1)
+                if (HOLD_OPENLOOP_ALL) {
+                    s_hold_duty_op = hold_duty_cal;
                     u_raw_op = s_hold_duty_op;
                 } else if (!s_holdpos_latched) {
                     /* ── [관통 피크 → hold 캐치] (2026-06-25) ─────────────────────
@@ -2324,56 +2377,43 @@ void HPSwitchTask_impl(void *argument)
              *  PUSH/HOLD:    FF + KP×err - KD×vel + slew + EMA 직접 인가.       */
             if (s_op_state == OP_READY_IDLE || s_op_state == OP_STANDBY) {
                 if (s_ret_brake_active == 1) {
-                    /* ── Phase 1 PULL_FAST: 즉각 능동 retract ──
-                     *  - 스위치 OFF 즉시 DIR_PULL + 0.18 duty 인가
-                     *  - 스프링 + 모터가 동시에 home 방향 → 빠른 초기 가속
-                     *  - 종료: pos ≤ HOME+5000 (≈0.5mm) 또는 400ms 타임아웃
-                     *          → BRAKE 단계 진입 (높은 속도를 home 직전에 흡수)
+                    /* ── Phase 1 DESCENT: 위치 피드포워드 스프링-평형 역전류 소프트랜딩 ──
+                     *  스위치 OFF 즉시 ~ home 근처까지 한 단계로 처리(과거 PULL+BRAKE 통합).
+                     *  ff(pos)=FF_HOME+FF_SLOPE×(pos−HOME) 로 위치별 스프링을 거의 상쇄(DIR_PUSH).
+                     *  거기서 BIAS 만큼만 덜 줘 약한 안쪽 net 힘 → 전 구간 등속 저속하강(쾅 없음).
+                     *  ▸ 속도피드백 없음 → 피드백 발진 구조적 불가(v2~v4 의 뱅뱅·되튕김 제거).
+                     *  ▸ 진입 즉시 ff≈평형 인가 → 스위치 OFF 시 스프링의 초기 "확" 당김 자체를
+                     *    상쇄(과거 PULL 이 만들던 운동량 누적도 없음).
+                     *  ▸ back-EMF + PWM-off low-side 제동이 빠를수록 더 제동 → 종속속도 수렴.
+                     *  종료: pos ≤ HOME+SEAT_BAND | DESCENT_TIMEOUT → Phase 3 SEAT.
                      *  ─────────────────────────────────────────────────────── */
-                    uint32_t pt = now - s_ret_pull_t0;
-                    bool pull_timeout = (pt >= RETURN_PULL_TIMEOUT_MS);
-                    bool near_brake   = (pos_f_op <= (float)(VCA_ADC_HOME + RETURN_PULL_END_BAND_ADC));
+                    uint32_t dt = now - s_ret_pull_t0;
+                    bool descent_timeout = (dt >= RETURN_DESCENT_TIMEOUT_MS);
+                    bool near_seat       = (pos_f_op <= (float)(VCA_ADC_HOME + RETURN_SEAT_BAND_ADC));
 
-                    if (near_brake || pull_timeout) {
-                        s_ret_brake_active = 2;
-                        s_ret_brake_t0     = now;
-                    } else {
-                        vca_on();
-                        TLE9201_SetDir(DIR_PULL);
-                        if (s_l1_enable) Loop1_Stop();
-                        VCA_SetDuty(RETURN_PULL_DUTY);
-                        g_motor_active = 1;
-                        g_duty_dbg = RETURN_PULL_DUTY;
-                        g_dir_dbg  = 0U;
-                    }
-                }
-                if (s_ret_brake_active == 2) {
-                    /* ── Phase 2 BRAKE: PUSH duty 로 home 직전 감속 ──
-                     *  - PULL_FAST 단계에서 가속된 속도를 home 충돌 전 흡수
-                     *  - DIR_PUSH + 0.13 duty: 스프링 거스르며 능동 감속
-                     *  - 종료: pos ≤ HOME+1500 (≈0.15mm) 또는 300ms 타임아웃
-                     *          → SEAT 단계 진입 (완전 밀착 보장)
-                     *  ─────────────────────────────────────────────────────── */
-                    uint32_t bt = now - s_ret_brake_t0;
-                    bool brake_timeout = (bt >= RETURN_BRAKE_TIMEOUT_MS_OP);
-                    bool near_home     = (pos_f_op <= (float)(VCA_ADC_HOME + RETURN_HOME_BAND_ADC));
-
-                    if (near_home || brake_timeout) {
+                    if (near_seat || descent_timeout) {
                         s_ret_brake_active = 3;
                         s_ret_seat_t0      = now;
                     } else {
+                        float dist_op = pos_f_op - (float)VCA_ADC_HOME;   /* home 까지 거리(ADC, ≥0) */
+                        if (dist_op < 0.0f) dist_op = 0.0f;
+                        float ff = RETURN_FF_DUTY_HOME + RETURN_FF_DUTY_SLOPE * dist_op; /* 위치별 평형 역전류 */
+                        float brake_duty_op = ff - RETURN_FF_DESCENT_BIAS;              /* BIAS 만큼 덜 = 약한 하강 */
+                        if (brake_duty_op < 0.0f)                brake_duty_op = 0.0f;
+                        if (brake_duty_op > RETURN_FF_DUTY_CEIL) brake_duty_op = RETURN_FF_DUTY_CEIL;
+
                         vca_on();
-                        TLE9201_SetDir(DIR_PUSH);
                         if (s_l1_enable) Loop1_Stop();
-                        VCA_SetDuty(RETURN_BRAKE_DUTY);
+                        TLE9201_SetDir(DIR_PUSH);
+                        VCA_SetDuty(brake_duty_op);
                         g_motor_active = 1;
-                        g_duty_dbg = RETURN_BRAKE_DUTY;
+                        g_duty_dbg = brake_duty_op;
                         g_dir_dbg  = 1U;
                     }
                 }
                 if (s_ret_brake_active == 3) {
                     /* ── Phase 3 SEAT: 약한 PULL duty 로 home 정마찰 극복 ──
-                     *  - 속도가 BRAKE 로 감속됨 → 슬램 없이 부드럽게 밀착
+                     *  - 속도가 DESCENT 로 이미 저속 → 슬램 없이 부드럽게 밀착
                      *  - DIR_PULL + 0.07 duty: 스프링 보조하여 home 스토퍼 안착
                      *  - 200ms 후 모터 완전 OFF
                      *  ─────────────────────────────────────────────────────── */
